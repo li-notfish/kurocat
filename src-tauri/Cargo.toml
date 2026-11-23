@@ -15,6 +15,12 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Production builds need the custom protocol, otherwise the binary loads the
+# Vite dev server (http://localhost:1420) instead of the embedded frontend
+# and the installed app only shows "localhost refused to connect".
+# `tauri build` enables `tauri/custom-protocol` on its own; a hand rolled
+# `cargo build --release` has to ask for it explicitly.
+custom-protocol = ["tauri/custom-protocol"]
 layout-108 = []
 win7 = ["tauri/custom-protocol"]
 
