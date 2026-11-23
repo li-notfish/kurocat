@@ -32,6 +32,7 @@ interface AppSettings {
   privacyPasswordGuard: boolean;
   tailKeyMode: TailKeyMode;
   tailKeyIds: string[];
+  pauseHooksWhileDrawing: boolean;
   obsEnabled: boolean;
   obsPort: number;
   obsHidePet: boolean;
@@ -91,6 +92,7 @@ let settings: AppSettings = {
   privacyPasswordGuard: true,
   tailKeyMode: 'smart',
   tailKeyIds: [...DEFAULT_TAIL_KEY_IDS],
+  pauseHooksWhileDrawing: false,
   obsEnabled: false,
   obsPort: 27421,
   obsHidePet: false,

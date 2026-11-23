@@ -7,7 +7,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr;
 use std::slice;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidP_GetButtonCaps, HidP_GetCaps, HidP_GetData, HidP_GetValueCaps, HidP_Input,
     HidP_MaxDataListLength, HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_DATA, HIDP_STATUS_SUCCESS,
@@ -41,9 +41,10 @@ const WACOM_CTL_6100_MAX_Y: f32 = 13500.0;
 const WACOM_CTL_6100_MAX_PRESSURE: f32 = 4095.0;
 // The pen sample is the one thing the user judges by latency: every
 // millisecond the nib is late shows up next to the real stroke in Photoshop.
-// Wacom pens report at roughly 130 Hz, so a 6 ms slot keeps up with the
-// hardware while still coalescing duplicated reports.
-const PEN_EMIT_INTERVAL: Duration = Duration::from_millis(6);
+// Wacom pens report at roughly 130 Hz, but every forwarded sample costs an
+// IPC round trip and a webview frame. A 10 ms slot still lands about 100
+// samples per second and takes a third of the pressure off the renderer.
+const PEN_EMIT_INTERVAL: Duration = Duration::from_millis(10);
 // A pen that is resting in range still needs a slow heartbeat, otherwise the
 // frontend's 1.2 s stale-pen release would drop it while it is still hovering.
 const PEN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -57,6 +58,15 @@ const PEN_MOVE_EPSILON: f32 = 1.0 / 512.0;
 // single report can drop it, which used to make the nib blink out of
 // existence in the middle of a stroke.
 const PEN_QUIET_RELEASE: Duration = Duration::from_millis(1500);
+// Windows mirrors the pen into the OS mouse pointer. While the nib is down
+// those synthetic moves only duplicate the pen stream, so the mouse hook
+// drops them instead of queueing thousands of them.
+const PEN_MOUSE_SUPPRESS_WINDOW: Duration = Duration::from_millis(400);
+// While the nib is down the drawing application is the only thing that
+// matters. The global hooks are paused for that time so Photoshop / CSP get
+// the untouched input path. The pause runs on a deadline, so a lost pen
+// report can never switch the hooks off for good.
+const PEN_DRAWING_PAUSE_WINDOW: Duration = Duration::from_millis(400);
 
 /// Latched "is the pen on the tablet" state.
 #[derive(Debug, Default)]
@@ -152,6 +162,8 @@ struct HidDevice {
     range: PenRange,
     last_sample: Option<PenSample>,
     pending_sample: Option<PenSample>,
+    /// Whether the nib touched the surface in the last forwarded sample.
+    pen_tip_down: bool,
     last_emit: Instant,
     max_data_len: usize,
     entries: Vec<HIDP_DATA>,
@@ -169,6 +181,8 @@ struct TabletContext {
     devices: HashMap<usize, HidDevice>,
     paths: HashMap<usize, String>,
     connected: HashSet<String>,
+    /// Whether the global hooks are currently paused because the nib is down.
+    drawing_pause_active: bool,
 }
 
 unsafe extern "system" fn tablet_wnd_proc(
@@ -228,6 +242,7 @@ fn run(app: AppHandle) {
         devices: HashMap::new(),
         paths: HashMap::new(),
         connected: HashSet::new(),
+        drawing_pause_active: false,
     };
     scan_initial_devices(&mut context);
 
@@ -695,6 +710,7 @@ fn build_hid_device(hdevice: HANDLE, meta: DeviceMeta) -> Option<HidDevice> {
         range: PenRange::default(),
         last_sample: None,
         pending_sample: None,
+        pen_tip_down: false,
         last_emit: Instant::now() - Duration::from_secs(1),
         max_data_len,
         entries: vec![unsafe { zeroed::<HIDP_DATA>() }; max_data_len],
@@ -1263,6 +1279,7 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     device.pending_sample = None;
     device.last_emit = Instant::now();
     device.last_sample = Some(sample);
+    device.pen_tip_down = sample.tip;
     let _ = app.emit(
         "kuro-input",
         InputEvent::TabletPen {
@@ -1284,6 +1301,43 @@ fn flush_pending_pens(context: &mut TabletContext) {
     for device in context.devices.values_mut() {
         flush_pen(device, &context.app);
     }
+    let tip_down = context.devices.values().any(|device| device.pen_tip_down);
+    update_pen_activity(context, tip_down);
+}
+
+/// Keeps the rest of the system in sync with what the nib is doing.
+///
+/// Windows mirrors the pen into the OS mouse pointer. While the nib is down
+/// those synthetic moves only duplicate the pen stream, so they are dropped
+/// inside the mouse hook. The global hooks themselves are paused for the
+/// same time so that Photoshop / CSP get the untouched input path.
+fn update_pen_activity(context: &mut TabletContext, tip_down: bool) {
+    if tip_down {
+        crate::input_hook::suppress_mouse_moves_for(PEN_MOUSE_SUPPRESS_WINDOW);
+    }
+
+    let should_pause = tip_down && pause_hooks_while_drawing(&context.app);
+    if should_pause {
+        // The pause runs on a deadline that every fresh pen report extends.
+        crate::input_hook::refresh_drawing_pause(PEN_DRAWING_PAUSE_WINDOW);
+    } else if context.drawing_pause_active {
+        crate::input_hook::set_drawing_pause(false);
+    }
+    context.drawing_pause_active = should_pause;
+}
+
+/// Reads the tray setting that decides whether the global hooks are paused
+/// while the nib is down.
+fn pause_hooks_while_drawing(app: &AppHandle) -> bool {
+    app.try_state::<crate::AppState>()
+        .and_then(|state| {
+            state
+                .settings
+                .lock()
+                .ok()
+                .map(|settings| settings.pause_hooks_while_drawing)
+        })
+        .unwrap_or(false)
 }
 
 fn pending_pen_timeout(context: &TabletContext) -> Option<Duration> {
@@ -1322,6 +1376,7 @@ mod tests {
             range: PenRange::default(),
             last_sample: None,
             pending_sample: None,
+            pen_tip_down: false,
             last_emit: Instant::now(),
             max_data_len: 0,
             entries: Vec::new(),

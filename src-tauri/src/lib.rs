@@ -3890,7 +3890,6 @@ pub fn win_restart_as_admin(app: AppHandle) {
         } else {
             true
         };
-
         if !handoff_ev.is_null() {
             unsafe {
                 let _ = CloseHandle(handoff_ev);
@@ -3923,7 +3922,7 @@ pub fn win_restart_as_admin(app: AppHandle) {
         // old instance cannot stall `app.exit(0)` and starve the elevated child.
         std::mem::forget(reset_guard);
         APP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
-        crate::input_hook::set_hooks_paused(true);
+        crate::input_hook::set_hooks_paused_manual(true);
         obs::shutdown_obs_server();
         if win_needs_win7_ulw() {
             win7_layered::shutdown();

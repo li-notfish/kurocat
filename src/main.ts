@@ -64,6 +64,7 @@ interface AppSettings {
   headphoneMode?: HeadphoneMode;
   fpsCap?: number;
   language?: string;
+  pauseHooksWhileDrawing: boolean;
 }
 
 type InputEvent =
@@ -189,6 +190,7 @@ let settings: AppSettings = {
   headphoneMode: 'off',
   fpsCap: 0,
   language: 'auto',
+  pauseHooksWhileDrawing: false,
 };
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];

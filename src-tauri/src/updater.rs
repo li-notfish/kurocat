@@ -913,7 +913,7 @@ fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), Stri
 
     // Immediately pause hooks, close overlays & release the single-instance lock so the
     // NSIS installer or restarted portable binary never hits a file/mutex race (#73, #74).
-    crate::input_hook::set_hooks_paused(true);
+    crate::input_hook::set_hooks_paused_manual(true);
     crate::shutdown_pet_windows();
 
     let app_clone = app.clone();
@@ -1087,7 +1087,7 @@ fn install_macos_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String
 
     // Immediately pause hooks, close overlays & release the single-instance lock so the
     // NSIS installer or restarted portable binary never hits a file/mutex race (#73, #74).
-    crate::input_hook::set_hooks_paused(true);
+    crate::input_hook::set_hooks_paused_manual(true);
     crate::shutdown_pet_windows();
 
     let app_clone = app.clone();

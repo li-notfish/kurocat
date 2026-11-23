@@ -1,5 +1,7 @@
 use serde::Serialize;
 #[cfg(windows)]
+use std::cell::Cell;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -110,8 +112,37 @@ enum RawHookMsg {
 static HOOK_TX: OnceLock<mpsc::Sender<RawHookMsg>> = OnceLock::new();
 static KEY_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static ALT_HELD: AtomicBool = AtomicBool::new(false);
+/// Whether the low-level hooks are currently uninstalled.
 static HOOKS_PAUSED: AtomicBool = AtomicBool::new(false);
+/// The user asked for the hooks to be paused (tray "pause guard").
+static HOOKS_PAUSED_MANUAL: AtomicBool = AtomicBool::new(false);
+/// Deadline until which the hooks stay paused because a tablet pen is drawing.
+static HOOKS_PAUSED_DRAWING_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static PASSWORD_PRIVACY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mouse moves are forwarded at most this often. Throttling inside the hook
+/// callback keeps the low-level hook cheap and the event queue bounded: a
+/// drawing tablet produces thousands of moves per second and every one of
+/// them used to be pushed into the queue only to be dropped again later.
+const MOUSE_MOVE_FORWARD_INTERVAL_MS: u64 = 8;
+
+/// Deadline until which mouse moves are not forwarded. Windows mirrors a
+/// tablet pen as a synthetic mouse, so while the pen is on the surface those
+/// moves duplicate the pen itself and only add load to every other program.
+static MOUSE_MOVES_SUPPRESSED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+thread_local! {
+    /// Last time a mouse move was forwarded, in process-relative milliseconds.
+    static LAST_MOUSE_MOVE_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Process-relative millisecond clock. Every thread shares it so a deadline
+/// written on one thread can be compared on another.
+fn now_millis() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 pub fn set_password_privacy_active(active: bool) {
     PASSWORD_PRIVACY_ACTIVE.store(active, Ordering::SeqCst);
@@ -182,8 +213,39 @@ pub fn is_alt_pressed() -> bool {
     ALT_HELD.load(Ordering::Relaxed)
 }
 
-pub fn set_hooks_paused(paused: bool) {
-    HOOKS_PAUSED.store(paused, Ordering::SeqCst);
+/// Pause or resume the global hooks because the user asked for it.
+pub fn set_hooks_paused_manual(paused: bool) {
+    HOOKS_PAUSED_MANUAL.store(paused, Ordering::SeqCst);
+    sync_hooks_paused();
+}
+
+/// Pause the global hooks while a tablet pen is drawing.
+pub fn set_drawing_pause(active: bool) {
+    HOOKS_PAUSED_DRAWING_UNTIL_MS.store(if active { u64::MAX } else { 0 }, Ordering::SeqCst);
+    sync_hooks_paused();
+}
+
+/// Keep the drawing pause alive. The deadline expires on its own, so a lost
+/// pen report can never leave the hooks paused forever.
+pub fn refresh_drawing_pause(duration: Duration) {
+    let until = now_millis().saturating_add(duration.as_millis() as u64);
+    HOOKS_PAUSED_DRAWING_UNTIL_MS.fetch_max(until, Ordering::SeqCst);
+    sync_hooks_paused();
+}
+
+/// Stop forwarding mouse moves for the given duration.
+pub fn suppress_mouse_moves_for(duration: Duration) {
+    let until = now_millis().saturating_add(duration.as_millis() as u64);
+    MOUSE_MOVES_SUPPRESSED_UNTIL_MS.fetch_max(until, Ordering::SeqCst);
+}
+
+/// Install or remove the low-level hooks according to the current reasons.
+fn sync_hooks_paused() {
+    let paused = HOOKS_PAUSED_MANUAL.load(Ordering::Relaxed)
+        || HOOKS_PAUSED_DRAWING_UNTIL_MS.load(Ordering::Relaxed) > now_millis();
+    if HOOKS_PAUSED.swap(paused, Ordering::SeqCst) == paused {
+        return;
+    }
     if paused {
         ALT_HELD.store(false, Ordering::Relaxed);
         #[cfg(windows)]
@@ -557,6 +619,10 @@ pub fn start_global_hooks(app: AppHandle) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
+            // The drawing pause runs on a deadline, so the applied state has
+            // to be reconciled even when no input arrives at all.
+            sync_hooks_paused();
+
             if HOOKS_PAUSED.load(Ordering::Relaxed) {
                 release_all_held(&app, &mut dedup, &mut mouse_down);
                 continue;
@@ -781,21 +847,44 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: usize, lparam: isiz
         if let Some(tx) = HOOK_TX.get() {
             match msg {
                 WM_MOUSEMOVE => {
-                    // Ultra-fast in-hook pre-filter (zero syscalls!) so 1000Hz-8000Hz gaming mice
-                    // never flood the Rust channel or stall WH_MOUSE_LL!
-                    let px = ms.pt.x;
-                    let py = ms.pt.y;
-                    let lx = LAST_HOOK_MOUSE_X.load(Ordering::Relaxed);
-                    let ly = LAST_HOOK_MOUSE_Y.load(Ordering::Relaxed);
-                    let now_ms = ms.time;
-                    let prev_ms = LAST_HOOK_MOUSE_MS.load(Ordering::Relaxed);
-                    if ((px as i64 - lx as i64).abs() > 1 || (py as i64 - ly as i64).abs() > 1)
-                        && (lx == i32::MIN || now_ms.wrapping_sub(prev_ms) >= 24)
-                    {
-                        LAST_HOOK_MOUSE_X.store(px, Ordering::Relaxed);
-                        LAST_HOOK_MOUSE_Y.store(py, Ordering::Relaxed);
-                        LAST_HOOK_MOUSE_MS.store(now_ms, Ordering::Relaxed);
-                        let _ = tx.send(RawHookMsg::MouseMove { x: px, y: py });
+                    // The pen mirrors itself into the OS mouse. Forwarding
+                    // those duplicates would slow every other program down
+                    // while the user draws, so they are dropped here.
+                    crate::diagnostics::MOUSE_MOVES_SEEN.fetch_add(1, Ordering::Relaxed);
+                    let now = now_millis();
+                    if MOUSE_MOVES_SUPPRESSED_UNTIL_MS.load(Ordering::Relaxed) <= now {
+                        // Ultra-fast in-hook pre-filter (zero syscalls!) so 1000Hz-8000Hz gaming mice
+                        // never flood the Rust channel or stall WH_MOUSE_LL!
+                        let px = ms.pt.x;
+                        let py = ms.pt.y;
+                        let lx = LAST_HOOK_MOUSE_X.load(Ordering::Relaxed);
+                        let ly = LAST_HOOK_MOUSE_Y.load(Ordering::Relaxed);
+                        let now_ms = ms.time;
+                        let prev_ms = LAST_HOOK_MOUSE_MS.load(Ordering::Relaxed);
+                        if ((px as i64 - lx as i64).abs() > 1 || (py as i64 - ly as i64).abs() > 1)
+                            && (lx == i32::MIN || now_ms.wrapping_sub(prev_ms) >= 24)
+                        {
+                            LAST_HOOK_MOUSE_X.store(px, Ordering::Relaxed);
+                            LAST_HOOK_MOUSE_Y.store(py, Ordering::Relaxed);
+                            LAST_HOOK_MOUSE_MS.store(now_ms, Ordering::Relaxed);
+                            // A second, finer gate keeps the frontend from
+                            // seeing more than 125 mouse moves per second.
+                            let forward = LAST_MOUSE_MOVE_MS.with(|slot| {
+                                let last = slot.get();
+                                let due = now.saturating_sub(last) >= MOUSE_MOVE_FORWARD_INTERVAL_MS;
+                                if due {
+                                    slot.set(now);
+                                }
+                                due
+                            });
+                            if forward {
+                                crate::diagnostics::MOUSE_MOVES_FORWARDED
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let _ = tx.send(RawHookMsg::MouseMove { x: px, y: py });
+                            }
+                        }
+                    } else {
+                        crate::diagnostics::MOUSE_MOVES_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 WM_LBUTTONDOWN => {
@@ -3412,7 +3501,6 @@ mod tests {
         assert_eq!(parse_macos_secure_input_pid("no secure input here"), None);
         assert_eq!(parse_macos_secure_input_pid("kCGSSessionSecureInputPID = 0"), None);
     }
-
     #[test]
     fn parses_macos_signing_identities_across_adhoc_self_signed_and_dev_id() {
         let universal_adhoc = "Executable=/Applications/KuroCat.app/Contents/MacOS/KuroCat\n\

@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 #[derive(Clone)]
 struct TrayCheckHandles {
     pause_guard: CheckMenuItem<Wry>,
+    pause_hooks_while_drawing: CheckMenuItem<Wry>,
     click_through: CheckMenuItem<Wry>,
     key_bubbles: CheckMenuItem<Wry>,
     privacy_guard: CheckMenuItem<Wry>,
@@ -62,6 +63,7 @@ pub fn sync_checkmarks(s: &AppSettings) {
         if let Some(h) = guard.as_ref() {
             let _ = h.click_through.set_checked(s.click_through_locked);
             let _ = h.key_bubbles.set_checked(s.show_key_bubbles);
+            let _ = h.pause_hooks_while_drawing.set_checked(s.pause_hooks_while_drawing);
             let _ = h.privacy_guard.set_checked(s.privacy_password_guard);
             let _ = h.sound_toggle.set_checked(s.sound_enabled);
             let _ = h.typing_sound_toggle.set_checked(s.typing_sound_enabled);
@@ -138,6 +140,14 @@ fn build_tray_menu(
         t(lang, "tray.key_bubbles"),
         true,
         initial.show_key_bubbles,
+        None::<&str>,
+    )?;
+    let pause_hooks_while_drawing = CheckMenuItem::with_id(
+        app,
+        "pause_hooks_while_drawing",
+        "绘画时暂停全局钩子",
+        true,
+        initial.pause_hooks_while_drawing,
         None::<&str>,
     )?;
     let privacy_guard = CheckMenuItem::with_id(
@@ -422,7 +432,14 @@ fn build_tray_menu(
         app,
         t(lang, "tray.interact_menu"),
         true,
-        &[&privacy_guard, &key_bubbles, &sound_toggle, &typing_sound_toggle, &always_on_top],
+        &[
+            &privacy_guard,
+            &pause_hooks_while_drawing,
+            &key_bubbles,
+            &sound_toggle,
+            &typing_sound_toggle,
+            &always_on_top,
+        ],
     )?;
 
     let sys_sep = PredefinedMenuItem::separator(app)?;
@@ -545,6 +562,7 @@ fn build_tray_menu(
 
     let handles = TrayCheckHandles {
         pause_guard,
+        pause_hooks_while_drawing,
         click_through,
         key_bubbles,
         privacy_guard,
@@ -653,7 +671,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     state
                         .paused_guard
                         .store(false, std::sync::atomic::Ordering::SeqCst);
-                    crate::input_hook::set_hooks_paused(false);
+                    crate::input_hook::set_hooks_paused_manual(false);
                     if let Ok(guard) = active_handles().lock() {
                         if let Some(h) = guard.as_ref() {
                             let _ = h.pause_guard.set_checked(false);
@@ -686,13 +704,14 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         state
                             .paused_guard
                             .store(false, std::sync::atomic::Ordering::SeqCst);
-                        crate::input_hook::set_hooks_paused(false);
+                        crate::input_hook::set_hooks_paused_manual(false);
                         if let Ok(guard) = active_handles().lock() {
                             if let Some(h) = guard.as_ref() {
                                 let _ = h.pause_guard.set_checked(false);
                             }
                         }
                         let lang = state.settings.lock().unwrap().language.clone();
+
                         if let Some(tray) = app.tray_by_id("kuro-tray") {
                             let _ = tray.set_tooltip(Some(default_tray_tooltip(&lang)));
                         }
@@ -719,13 +738,14 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     state
                         .paused_guard
                         .store(next, std::sync::atomic::Ordering::SeqCst);
-                    crate::input_hook::set_hooks_paused(next);
+                    crate::input_hook::set_hooks_paused_manual(next);
                     if let Ok(guard) = active_handles().lock() {
                         if let Some(h) = guard.as_ref() {
                             let _ = h.pause_guard.set_checked(next);
                         }
                     }
                     let lang = state.settings.lock().unwrap().language.clone();
+
                     if let Some(tray) = app.tray_by_id("kuro-tray") {
                         let tip = if next {
                             format!("KuroCat ({})", t(&lang, "tray.pause_guard"))
@@ -756,6 +776,16 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     let updated = {
                         let mut s = state.settings.lock().unwrap();
                         s.show_key_bubbles = !s.show_key_bubbles;
+                        crate::config::save_settings(&s);
+                        s.clone()
+                    };
+                    sync_checkmarks(&updated);
+                    let _ = app.emit("kuro-settings", updated);
+                }
+                "pause_hooks_while_drawing" => {
+                    let updated = {
+                        let mut s = state.settings.lock().unwrap();
+                        s.pause_hooks_while_drawing = !s.pause_hooks_while_drawing;
                         crate::config::save_settings(&s);
                         s.clone()
                     };

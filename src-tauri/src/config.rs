@@ -116,6 +116,10 @@ pub fn normalize_language(raw: &str) -> String {
     crate::i18n::normalize_language_setting(raw)
 }
 
+fn default_pause_hooks_while_drawing() -> bool {
+    false
+}
+
 pub fn default_keyboard_layout() -> String {
     if cfg!(feature = "layout-108") {
         "108".to_string()
@@ -245,6 +249,8 @@ pub struct AppSettings {
     pub fps_cap: u16,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_pause_hooks_while_drawing")]
+    pub pause_hooks_while_drawing: bool,
 }
 
 impl Default for AppSettings {
@@ -283,6 +289,7 @@ impl Default for AppSettings {
             headphone_mode: default_headphone_mode(),
             fps_cap: default_fps_cap(),
             language: default_language(),
+            pause_hooks_while_drawing: default_pause_hooks_while_drawing(),
         }
     }
 }
