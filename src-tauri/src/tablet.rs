@@ -39,12 +39,54 @@ const WACOM_AUX_REPORT_ID: u8 = 0x11;
 const WACOM_CTL_6100_MAX_X: f32 = 21600.0;
 const WACOM_CTL_6100_MAX_Y: f32 = 13500.0;
 const WACOM_CTL_6100_MAX_PRESSURE: f32 = 4095.0;
-// The cat canvas renders at ~60 Hz. Emitting much faster than that only
-// serializes duplicate IPC events and starves the Surface webview.
-const PEN_EMIT_INTERVAL: Duration = Duration::from_millis(12);
+// The pen sample is the one thing the user judges by latency: every
+// millisecond the nib is late shows up next to the real stroke in Photoshop.
+// Wacom pens report at roughly 130 Hz, so a 6 ms slot keeps up with the
+// hardware while still coalescing duplicated reports.
+const PEN_EMIT_INTERVAL: Duration = Duration::from_millis(6);
 // A pen that is resting in range still needs a slow heartbeat, otherwise the
 // frontend's 1.2 s stale-pen release would drop it while it is still hovering.
 const PEN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+// A hovering pen jitters by a fraction of a millimetre. Without a dead zone
+// the sampler would forward that noise to the webview as a continuous stream
+// of events and starve the renderer.
+const PEN_MOVE_EPSILON: f32 = 1.0 / 512.0;
+// The nib's range state is latched: as soon as any of the proximity signals
+// fires the pen counts as being on the tablet and it stays there until the
+// reports go quiet. Firmware generations disagree about the status byte and a
+// single report can drop it, which used to make the nib blink out of
+// existence in the middle of a stroke.
+const PEN_QUIET_RELEASE: Duration = Duration::from_millis(1500);
+
+/// Latched "is the pen on the tablet" state.
+#[derive(Debug, Default)]
+struct PenRange {
+    latched: bool,
+    quiet_since: Option<Instant>,
+}
+
+impl PenRange {
+    /// Feeds one report's raw proximity evidence into the latch and returns
+    /// the range state that has to be published for that report.
+    fn observe(&mut self, signal: bool, now: Instant) -> bool {
+        if signal {
+            self.latched = true;
+            self.quiet_since = None;
+            return true;
+        }
+        if !self.latched {
+            return false;
+        }
+        let since = *self.quiet_since.get_or_insert(now);
+        let quiet = now.checked_duration_since(since).unwrap_or_default();
+        if quiet >= PEN_QUIET_RELEASE {
+            self.latched = false;
+            self.quiet_since = None;
+            return false;
+        }
+        true
+    }
+}
 
 pub fn start(app: AppHandle) {
     let _ = std::thread::Builder::new()
@@ -102,9 +144,12 @@ struct HidDevice {
     buttons: HashMap<DataKey, ButtonInfo>,
     last_x: f32,
     last_y: f32,
+    last_raw_x: u32,
+    last_raw_y: u32,
     last_tilt_x: f32,
     last_tilt_y: f32,
     last_pressure: f32,
+    range: PenRange,
     last_sample: Option<PenSample>,
     pending_sample: Option<PenSample>,
     last_emit: Instant,
@@ -642,9 +687,12 @@ fn build_hid_device(hdevice: HANDLE, meta: DeviceMeta) -> Option<HidDevice> {
         buttons,
         last_x: 0.5,
         last_y: 0.5,
+        last_raw_x: 0,
+        last_raw_y: 0,
         last_tilt_x: 0.0,
         last_tilt_y: 0.0,
         last_pressure: 0.0,
+        range: PenRange::default(),
         last_sample: None,
         pending_sample: None,
         last_emit: Instant::now() - Duration::from_secs(1),
@@ -846,11 +894,31 @@ fn parse_wacom_pen(device: &mut HidDevice, report: &[u8], index: usize) -> Optio
     let barrel = buttons & 0x02 != 0;
     let second_barrel = buttons & 0x04 != 0;
     let eraser = buttons & 0x08 != 0;
-    let in_range = buttons & 0x20 != 0 || tip;
 
-    if in_range {
+    // Wacom packs the whole tool state into a single byte and the firmware
+    // generations disagree about which bit carries "in proximity". Deriving
+    // the range state from every reliable signal instead of one bit keeps the
+    // nib alive: a moved coordinate, a pressed button or any contact always
+    // means the pen is on the tablet.
+    let proximity = raw_buttons & 0x01 != 0 || buttons & 0x20 != 0;
+    // Some drivers report the origin instead of the last position once the
+    // pen leaves the tablet. A nib at the exact origin without pressure is
+    // the only thing that tells that apart from a real stroke in the corner.
+    let lost = x == 0 && y == 0 && pressure <= 0.002;
+    let moved = !lost && (x != device.last_raw_x || y != device.last_raw_y);
+    // Any single signal is enough to latch the nib onto the tablet. The latch
+    // keeps a dropped status byte from blinking the pen away mid-stroke.
+    let signal = !lost && (proximity || moved || tip || barrel || second_barrel || eraser);
+    let in_range = device.range.observe(signal, Instant::now());
+
+    // A latched report that reports the origin means the pen left the
+    // tablet, so the last known position has to survive instead of the nib
+    // jumping into the corner.
+    if in_range && !lost {
         device.last_x = (x as f32 / device.wacom_max_x.max(1.0)).clamp(0.0, 1.0);
         device.last_y = (y as f32 / device.wacom_max_y.max(1.0)).clamp(0.0, 1.0);
+        device.last_raw_x = x;
+        device.last_raw_y = y;
     }
     device.last_pressure = if in_range { pressure } else { 0.0 };
     Some(PenSample {
@@ -1002,14 +1070,19 @@ fn parse_hid_entries(
 
     tip |= device.last_pressure > 0.002;
     let has_range_cap = device.range_reports.contains(&report_id);
-    if !has_range_cap {
-        in_range = tip
+    let signal = if has_range_cap {
+        in_range
+    } else {
+        tip
             || device.last_pressure > 0.002
             || has_position
             || barrel
             || second_barrel
-            || eraser;
-    }
+            || eraser
+    };
+    // Same latch as the Wacom path: one report that proves the pen is on the
+    // tablet keeps it there until the reports go quiet.
+    let in_range = device.range.observe(signal, Instant::now());
     if !in_range {
         device.last_pressure = 0.0;
     }
@@ -1153,11 +1226,25 @@ fn pen_controls_changed(previous: PenSample, next: PenSample) -> bool {
         || previous.in_range != next.in_range
 }
 
+fn pen_moved(previous: PenSample, next: PenSample) -> bool {
+    // A nib that rests on the tablet still reports tiny jitter. Only a real
+    // displacement or a pressure change is worth forwarding to the webview.
+    (previous.nx - next.nx).abs() > PEN_MOVE_EPSILON
+        || (previous.ny - next.ny).abs() > PEN_MOVE_EPSILON
+        || (previous.pressure - next.pressure).abs() > 0.02
+}
+
 fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     let Some(sample) = device.pending_sample else {
         return;
     };
-    let unchanged = device.last_sample == Some(sample);
+    let controls_changed = device
+        .last_sample
+        .map_or(true, |previous| pen_controls_changed(previous, sample));
+    let moved = device
+        .last_sample
+        .map_or(true, |previous| pen_moved(previous, sample));
+    let unchanged = !moved && !controls_changed;
     let heartbeat_due =
         unchanged && sample.in_range && device.last_emit.elapsed() >= PEN_HEARTBEAT_INTERVAL;
     if unchanged && !heartbeat_due {
@@ -1165,9 +1252,6 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
         return;
     }
 
-    let controls_changed = device
-        .last_sample
-        .map_or(true, |previous| pen_controls_changed(previous, sample));
     if !sample.in_range && !controls_changed {
         device.pending_sample = None;
         return;
@@ -1230,9 +1314,12 @@ mod tests {
             buttons: HashMap::new(),
             last_x: 0.5,
             last_y: 0.5,
+            last_raw_x: 0,
+            last_raw_y: 0,
             last_tilt_x: 0.0,
             last_tilt_y: 0.0,
             last_pressure: 0.0,
+            range: PenRange::default(),
             last_sample: None,
             pending_sample: None,
             last_emit: Instant::now(),
@@ -1402,6 +1489,146 @@ mod tests {
             infer_wacom_pen_limits(&values),
             (32000.0, 20000.0, 8191.0)
         );
+    }
+
+    #[test]
+    fn derives_proximity_from_movement_when_the_status_bit_is_clear() {
+        // Firmware generations disagree about which bit carries "in
+        // proximity". A nib that moved is on the tablet no matter what the
+        // status byte says.
+        let mut report = vec![0u8; 192];
+        report[0] = WACOM_PEN_REPORT_ID;
+        report[1] = 0x00;
+        report[2] = 0x40;
+        report[3] = 0x00;
+        report[4] = 0x00;
+        report[5] = 0x40;
+        report[6] = 0x00;
+        report[7] = 0x00;
+        report[8] = 0x00;
+        report[9] = 0x00;
+
+        let mut device = fake_device();
+        let sample = parse_wacom_pen(&mut device, &report, 0).expect("valid pen report");
+        assert!(sample.in_range, "a moved nib has to stay in range");
+
+        // The very same report without movement and without a proximity bit
+        // is a dropped status byte, not a pen that left the tablet. The
+        // latched range keeps the nib where it was.
+        let parked = report.clone();
+        let sample = parse_wacom_pen(&mut device, &parked, 0).expect("valid pen report");
+        assert!(sample.in_range, "a parked nib has to stay in range");
+    }
+
+    #[test]
+    fn latches_the_pen_range_until_the_reports_go_quiet() {
+        let base = Instant::now();
+        let mut range = PenRange::default();
+
+        assert!(!range.observe(false, base), "an untouched pen is out of range");
+        assert!(range.observe(true, base), "one signal latches the nib");
+        assert!(
+            range.observe(false, base + Duration::from_millis(100)),
+            "a dropped status byte must not release the nib"
+        );
+        assert!(
+            range.observe(false, base + Duration::from_millis(1_400)),
+            "the nib survives a short glitch"
+        );
+        assert!(
+            !range.observe(false, base + Duration::from_millis(1_600)),
+            "the nib is released once the reports go quiet"
+        );
+        assert!(
+            range.observe(true, base + Duration::from_millis(1_700)),
+            "a new signal latches the nib again"
+        );
+    }
+
+    #[test]
+    fn keeps_updating_the_position_while_the_range_is_latched() {
+        let mut report = vec![0u8; 192];
+        report[0] = WACOM_PEN_REPORT_ID;
+        report[1] = 0x20;
+        report[2] = 0x40;
+        report[3] = 0x00;
+        report[4] = 0x00;
+        report[5] = 0x40;
+        report[6] = 0x00;
+        report[7] = 0x00;
+        report[8] = 0x00;
+        report[9] = 0x00;
+
+        let mut device = fake_device();
+        let first = parse_wacom_pen(&mut device, &report, 0).expect("valid pen report");
+        assert!(first.in_range);
+
+        // The status byte drops but the nib moved: the latched range keeps the
+        // pen on the tablet and the position has to follow.
+        let mut moved = report.clone();
+        moved[1] = 0x00;
+        moved[2] = 0x80;
+        let second = parse_wacom_pen(&mut device, &moved, 0).expect("valid pen report");
+        assert!(second.in_range);
+        assert!(
+            second.nx > first.nx,
+            "the nib has to follow the report while the range is latched"
+        );
+    }
+
+    #[test]
+    fn treats_the_origin_without_pressure_as_out_of_range() {
+        // Drivers that report the origin once the pen leaves the tablet must
+        // not drag the nib into the corner.
+        let mut report = vec![0u8; 192];
+        report[0] = WACOM_PEN_REPORT_ID;
+        report[1] = 0x20;
+        report[2] = 0x40;
+        report[3] = 0x00;
+        report[4] = 0x00;
+        report[5] = 0x40;
+        report[6] = 0x00;
+        report[7] = 0x00;
+        report[8] = 0x00;
+        report[9] = 0x00;
+
+        let mut device = fake_device();
+        let sample = parse_wacom_pen(&mut device, &report, 0).expect("valid pen report");
+        assert!(sample.in_range);
+        assert!(sample.nx > 0.001, "the nib starts on the reported spot");
+
+        let mut origin = report.clone();
+        origin[2] = 0x00;
+        origin[3] = 0x00;
+        origin[4] = 0x00;
+        origin[5] = 0x00;
+        origin[6] = 0x00;
+        origin[7] = 0x00;
+        let sample = parse_wacom_pen(&mut device, &origin, 0).expect("valid pen report");
+        assert!(sample.in_range, "the latch keeps the nib alive");
+        assert!(
+            sample.nx > 0.001,
+            "the origin without pressure must not drag the nib into the corner"
+        );
+    }
+
+    #[test]
+    fn ignores_sub_pixel_jitter_but_reports_real_movement() {
+        let base = PenSample {
+            nx: 0.4,
+            ny: 0.4,
+            pressure: 0.2,
+            in_range: true,
+            ..PenSample::default()
+        };
+        let jitter = PenSample {
+            nx: 0.4 + PEN_MOVE_EPSILON * 0.5,
+            ..base
+        };
+        let moved = PenSample { nx: 0.5, ..base };
+
+        assert!(!pen_moved(base, jitter));
+        assert!(pen_moved(base, moved));
     }
 
     #[test]

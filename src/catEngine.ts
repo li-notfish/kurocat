@@ -43,6 +43,17 @@ const EDGE_PROTECTED_WASD_IDS = new Set(['q', 'w', 'e', 'a', 's', 'd', 'z', 'x',
 export type DevicePreviewMode = 'auto' | 'keyboard' | 'tablet' | 'gamepad';
 type ForegroundDevice = Exclude<DevicePreviewMode, 'auto'>;
 
+// A tablet keeps the foreground while the pen is really being used. A key
+// press inside this window belongs to the tablet (an ExpressKey), not to the
+// keyboard.
+const TABLET_ACTIVITY_WINDOW_MS = 1400;
+// The keyboard hand-over is deferred by this long so a late ExpressKey HID
+// report can still claim the foreground before the keyboard model takes over.
+const TABLET_KEY_SWITCH_GRACE_MS = 220;
+// A dropped range report must not blank the nib either: the current state is
+// held for this long before the pen is released.
+const TABLET_RANGE_GRACE_MS = 400;
+
 interface Vec2 {
   x: number;
   y: number;
@@ -1487,6 +1498,19 @@ export class KuroCatEngine {
   private tabletFallbackTimer: number | null = null;
   private tabletPhysicalKeys = [false, false, false, false];
 
+  // Tablet input arbitration. A Wacom ExpressKey produces two independent
+  // signals - a keyboard shortcut from the OS and a vendor HID report - and
+  // they can arrive in any order. Reacting to whichever lands first makes the
+  // keyboard and the tablet model alternate, so the tablet keeps the
+  // foreground until it is really idle and the keyboard hand-over waits for the
+  // HID report to arrive.
+  private lastTabletSignalAt = -10000;
+  private lastTabletActivityAt = -10000;
+  private lastTabletKeyAt = -10000;
+  private lastTabletNx = -1;
+  private lastTabletNy = -1;
+  private pendingTabletKeySwitch: number | null = null;
+
   // Cursor & 100% live eye tracking + 2.5D head turn
   private cursorRelX = 0.5;
   private cursorRelY = 0.5;
@@ -1741,6 +1765,7 @@ export class KuroCatEngine {
       window.clearTimeout(this.tabletFallbackTimer);
       this.tabletFallbackTimer = null;
     }
+    this.cancelTabletKeyboardSwitch();
   }
 
   public releaseCachedResources(): void {
@@ -2337,6 +2362,21 @@ export class KuroCatEngine {
       return;
     }
 
+    // The shortcut may still be an ExpressKey whose HID report has not been
+    // delivered yet. Hold the model back for a moment so the tablet can claim
+    // it - otherwise keyboard and tablet alternate on every single press.
+    if (this.shouldDeferKeyboardSwitchForTablet()) {
+      this.scheduleTabletKeyboardSwitch();
+      if (!repeat) {
+        if (spec) {
+          const label = formatBubbleForVk(vk, spec);
+          if (label) this.spawnTabletKeyBadge(label, now);
+        }
+        this.bodyBob = Math.min(0.8, this.bodyBob + 0.35);
+      }
+      return;
+    }
+
     this.setDeviceFromInput('keyboard');
     if (!spec) return;
     this.wakeCat(now, repeat ? 'gentle' : 'abrupt');
@@ -2624,9 +2664,46 @@ export class KuroCatEngine {
     if (this.deviceMode !== 'tablet') return false;
     if (this.forcedDevice === 'tablet') return false;
     if (this.tabletHardwareConnected) {
-      return this.penActive || now - this.nativeTabletAt < 1400;
+      // The pen is being used right now, or an ExpressKey report landed a
+      // moment ago: the key press belongs to the tablet, not to the keyboard.
+      return (
+        now - this.lastTabletActivityAt < TABLET_ACTIVITY_WINDOW_MS ||
+        now - this.lastTabletKeyAt < TABLET_ACTIVITY_WINDOW_MS
+      );
     }
     return now - this.penPointerAt < 1400;
+  }
+
+  private shouldDeferKeyboardSwitchForTablet(): boolean {
+    if (this.forcedDevice) return false;
+    if (!this.tabletHardwareConnected) return false;
+    return this.deviceMode === 'tablet';
+  }
+
+  private scheduleTabletKeyboardSwitch(): void {
+    if (this.pendingTabletKeySwitch !== null) return;
+    this.pendingTabletKeySwitch = window.setTimeout(() => {
+      this.pendingTabletKeySwitch = null;
+      if (this.forcedDevice) return;
+      if (this.deviceMode !== 'tablet') return;
+      this.setDeviceFromInput('keyboard');
+    }, TABLET_KEY_SWITCH_GRACE_MS);
+  }
+
+  private cancelTabletKeyboardSwitch(): void {
+    if (this.pendingTabletKeySwitch === null) return;
+    window.clearTimeout(this.pendingTabletKeySwitch);
+    this.pendingTabletKeySwitch = null;
+  }
+
+  private tabletPenOwnsInput(now: number): boolean {
+    // A connected tablet owns the mouse buttons while its pen is alive. The
+    // raw report and the synthetic ink event race each other, so both clocks
+    // have to be considered before a mouse button may be taken seriously.
+    if (!this.tabletHardwareConnected) return false;
+    return (
+      now - this.lastTabletSignalAt < 1500 || now - this.lastNativePenAt < 1500
+    );
   }
 
   private shouldKeepGamepadOverMouse(): boolean {
@@ -2699,14 +2776,13 @@ export class KuroCatEngine {
     if (this.shouldHoldGamepadThroughHandshake(now)) return;
     if (this.deviceMode === 'tablet') {
       if (this.forcedDevice === 'tablet') return;
-      if (
-        now - this.nativeTabletAt < 350 ||
-        (this.penActive && now - this.lastNativePenAt < 500)
-      ) {
-        this.handleTabletPointerButton(button, true, now);
-        return;
-      }
-      if (!this.tabletHardwareConnected && now - this.penPointerAt < 1400) {
+      if (this.tabletHardwareConnected) {
+        // The raw HID pen owns the tablet surface. Windows Ink mirrors the pen
+        // as a synthetic mouse, so a mouse button here is the pen's own tip
+        // press: turning it into a second pen press is exactly what makes the
+        // nib fight with the tablet.
+        if (this.tabletPenOwnsInput(now)) return;
+      } else if (now - this.penPointerAt < 1400) {
         this.handleTabletPointerButton(button, true, now);
         return;
       }
@@ -2745,12 +2821,14 @@ export class KuroCatEngine {
     const now = performance.now();
     if (this.deviceMode === 'tablet') {
       if (this.forcedDevice === 'tablet') return;
-      if (
+      if (this.tabletHardwareConnected) {
+        // Synthetic ink events must never release the real HID tip either.
+        if (this.tabletPenOwnsInput(now)) return;
+      } else if (
         this.penDown ||
         this.penBarrel ||
         this.penSecondBarrel ||
-        now - this.nativeTabletAt < 500 ||
-        (this.penActive && now - this.lastNativePenAt < 700)
+        now - this.penPointerAt < 1400
       ) {
         this.handleTabletPointerButton(button, false, now);
         return;
@@ -2826,6 +2904,12 @@ export class KuroCatEngine {
     this.penTrail = [];
     this.tabletPhysicalKeys = [false, false, false, false];
     this.tabletInRange = false;
+    this.cancelTabletKeyboardSwitch();
+    this.lastTabletSignalAt = -10000;
+    this.lastTabletActivityAt = -10000;
+    this.lastTabletKeyAt = -10000;
+    this.lastTabletNx = -1;
+    this.lastTabletNy = -1;
     if (mode === 'auto') {
       // With no real input yet, resume the device a fresh connection would
       // select. This also stops the no-hardware gamepad demo immediately.
@@ -2858,6 +2942,12 @@ export class KuroCatEngine {
     this.nativePenSeen = false;
     this.lastNativePenAt = -10000;
     this.nativeTabletAt = -10000;
+    this.lastTabletSignalAt = -10000;
+    this.lastTabletActivityAt = -10000;
+    this.lastTabletKeyAt = -10000;
+    this.lastTabletNx = -1;
+    this.lastTabletNy = -1;
+    this.cancelTabletKeyboardSwitch();
     this.penActive = false;
     this.penVisible = 0;
     if (this.tabletFallbackTimer !== null) {
@@ -2872,6 +2962,12 @@ export class KuroCatEngine {
     this.lastNativePenAt = -10000;
     this.tabletInRange = false;
     this.tabletPhysicalKeys = [false, false, false, false];
+    this.cancelTabletKeyboardSwitch();
+    this.lastTabletSignalAt = -10000;
+    this.lastTabletActivityAt = -10000;
+    this.lastTabletKeyAt = -10000;
+    this.lastTabletNx = -1;
+    this.lastTabletNy = -1;
     this.penActive = false;
     this.penDown = false;
     this.penBarrel = false;
@@ -2909,18 +3005,45 @@ export class KuroCatEngine {
     const now = performance.now();
     this.tabletInRange = inRange;
     this.penLastAt = now;
+    // Any tablet traffic keeps the tablet authoritative, even when the nib is
+    // lifted: the raw report still proves the tablet is the live device.
+    this.nativeTabletAt = now;
+    this.lastTabletSignalAt = now;
     if (this.tabletFallbackTimer !== null) {
       window.clearTimeout(this.tabletFallbackTimer);
       this.tabletFallbackTimer = null;
     }
+
+    // A hovering pen reports the same spot over and over. Only real movement or
+    // a button edge counts as the pen being used.
+    const moved =
+      Math.abs(nx - this.lastTabletNx) > 0.0015 || Math.abs(ny - this.lastTabletNy) > 0.0015;
+    const contactChanged =
+      tip !== this.penDown ||
+      barrel !== this.penBarrel ||
+      secondBarrel !== this.penSecondBarrel ||
+      eraser !== this.penEraser;
+    this.lastTabletNx = nx;
+    this.lastTabletNy = ny;
+    if (moved || contactChanged) {
+      this.lastTabletActivityAt = now;
+      // The pen is really in use, so a keyboard shortcut arriving now is an
+      // ExpressKey and must not take the model away.
+      this.cancelTabletKeyboardSwitch();
+    }
+
     if (!inRange) {
-      this.updatePenButtons(false, false, false, false, now);
-      this.penActive = false;
-      this.penPressure = 0;
+      // The backend latches the range for 1.5 s, but a single dropped report
+      // must not blank the nib either. Hold the current state for a short
+      // grace; the stale-pen timeout releases the pen afterwards.
+      if (now - this.lastNativePenAt >= TABLET_RANGE_GRACE_MS) {
+        this.updatePenButtons(false, false, false, false, now);
+        this.penPressure = 0;
+      }
+      // The last position is kept so the model does not jump.
       return;
     }
 
-    this.nativeTabletAt = now;
     this.nativePenSeen = true;
     this.lastNativePenAt = now;
     this.setDeviceFromInput('tablet');
@@ -2956,6 +3079,12 @@ export class KuroCatEngine {
     const next = [0, 1, 2, 3].map((index) => (mask & (1 << index)) !== 0);
     this.tabletPhysicalKeys = next;
     this.nativeTabletAt = now;
+    this.lastTabletSignalAt = now;
+    this.lastTabletKeyAt = now;
+    this.lastTabletActivityAt = now;
+    // The ExpressKey report is the authoritative "the tablet did that" signal.
+    // It wins over the keyboard shortcut the OS delivered for the same press.
+    this.cancelTabletKeyboardSwitch();
     if (this.tabletFallbackTimer !== null) {
       window.clearTimeout(this.tabletFallbackTimer);
       this.tabletFallbackTimer = null;
@@ -4519,6 +4648,7 @@ export class KuroCatEngine {
         if (peekP > 0.01) {
           ctx.globalAlpha = Math.max(0, 1 - peekP * 3.0);
         }
+        if (this.deviceMode === 'tablet') this.drawTabletPen(ctx);
         this.dafeiyu.renderForeground(ctx, this.lastDt, now, layout);
         if (this.deviceMode === 'gamepad') this.drawGamepadStickRings(ctx);
         ctx.restore();
@@ -4548,7 +4678,6 @@ export class KuroCatEngine {
           this.drawTabletBadges(ctx);
         }
       }
-      if (this.deviceMode === 'tablet' && peekP < 0.4) this.drawTabletPen(ctx);
       ctx.restore();
       return;
     }
@@ -4585,13 +4714,16 @@ export class KuroCatEngine {
     // Layer 3: Exact measured spine-deformable cat silhouette (ears, cheeks, neck, pear belly, grounded hind feet, eyes & tiny whiskers)
     this.drawCatBody(ctx, breath, purrShift);
 
-    // Layer 4: True-scale velvety cat paws (tapered idle legs / edge-gripping peek paws / poking / grooming!)
+    // Layer 4: The stylus the cat holds. It is drawn before the paws so the paw
+    // wraps the grip instead of the pen floating on top of the fur.
+    if (this.deviceMode === 'tablet') this.drawTabletPen(ctx);
+
+    // Layer 5: True-scale velvety cat paws (tapered idle legs / planted diagonal mouse support leg / bent curled chest paw / plump round poking paw!)
     this.drawPaw(ctx, this.leftPaw, breath);
     this.drawPaw(ctx, this.rightPaw, breath);
     if (this.deviceMode === 'gamepad') this.drawGamepadStickRings(ctx);
-    if (this.deviceMode === 'tablet') this.drawTabletPen(ctx);
 
-    // Layer 4.5: Alive cat comic FX (anger 💢 mark, tail-slam starburst & dust puffs, sleepy Zzz, chin hearts, groom sparkles)
+    // Layer 4.5: Alive cat comic FX (anger 💢 mark, tail-slam starburst & dust puffs, sleepy Zzz bubbles)
     this.drawCatAliveFx(ctx, performance.now(), breath);
     ctx.restore();
 
