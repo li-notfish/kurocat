@@ -338,6 +338,18 @@ fn build_tray_menu(
     )?;
 
     let reset_pos = MenuItem::with_id(app, "reset_pos", t(lang, "tray.reset_pos"), true, None::<&str>)?;
+    let device_auto = MenuItem::with_id(app, "device_auto", "自动（跟随真实输入）", true, None::<&str>)?;
+    let device_keyboard = MenuItem::with_id(app, "device_keyboard", "键盘 / 鼠标模型", true, None::<&str>)?;
+    let device_tablet = MenuItem::with_id(app, "device_tablet", "数位板演示", true, None::<&str>)?;
+    let device_gamepad = MenuItem::with_id(app, "device_gamepad", "手柄演示", true, None::<&str>)?;
+    let device_menu = Submenu::with_items(
+        app,
+        "设备演示",
+        true,
+        &[&device_auto, &device_keyboard, &device_tablet, &device_gamepad],
+    )?;
+
+
     #[cfg(windows)]
     let desktop_shortcut =
         MenuItem::with_id(app, "desktop_shortcut", t(lang, "tray.desktop_shortcut"), true, None::<&str>)?;
@@ -478,6 +490,7 @@ fn build_tray_menu(
             &kb_menu,
             &tail_menu,
             &interact_menu,
+            &device_menu,
             &obs_menu,
             &system_menu,
             &sep2,
@@ -499,6 +512,7 @@ fn build_tray_menu(
             &kb_menu,
             &tail_menu,
             &interact_menu,
+            &device_menu,
             &obs_menu,
             &system_menu,
             &sep2,
@@ -520,6 +534,7 @@ fn build_tray_menu(
             &kb_menu,
             &tail_menu,
             &interact_menu,
+            &device_menu,
             &obs_menu,
             &system_menu,
             &sep2,
@@ -965,6 +980,22 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                 "lang_en-US" => apply_language_and_save(app, "en-US"),
                 "lang_ja-JP" => apply_language_and_save(app, "ja-JP"),
                 "lang_ko-KR" => apply_language_and_save(app, "ko-KR"),
+                "device_auto" => {
+                    set_pet_visible(app, true);
+                    let _ = app.emit("kuro-device-preview", "auto");
+                }
+                "device_keyboard" => {
+                    set_pet_visible(app, true);
+                    let _ = app.emit("kuro-device-preview", "keyboard");
+                }
+                "device_tablet" => {
+                    set_pet_visible(app, true);
+                    let _ = app.emit("kuro-device-preview", "tablet");
+                }
+                "device_gamepad" => {
+                    set_pet_visible(app, true);
+                    let _ = app.emit("kuro-device-preview", "gamepad");
+                }
                 "desktop_shortcut" => {
                     let _ = crate::config::create_desktop_shortcut();
                 }

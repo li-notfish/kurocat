@@ -32,13 +32,16 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSGraphics", "NSScreen", "NSWindow", "NSWorkspace", "block2"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString", "CFUUID"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSGeometry", "NSNotification", "NSOperation", "NSProcessInfo", "NSString", "NSValue", "block2"] }
+gilrs = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
+  "Win32_Devices_HumanInterfaceDevice",
   "Win32_Graphics_Gdi",
   "Win32_Networking_WinHttp",
   "Win32_UI_Shell",
+  "Win32_UI_Input",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_Security",
@@ -52,6 +55,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Com",
   "Win32_UI_Accessibility",
 ] }
+gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
 
 [profile.release]
 panic = "abort"

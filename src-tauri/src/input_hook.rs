@@ -35,6 +35,47 @@ pub enum InputEvent {
         ny: f64,
     },
     PrivacyTyping,
+    GamepadConnected {
+        id: u32,
+        name: String,
+    },
+    GamepadDisconnected {
+        id: u32,
+    },
+    GamepadButton {
+        id: u32,
+        button: u32,
+        pressed: bool,
+        value: f32,
+    },
+    GamepadAxis {
+        id: u32,
+        axis: u32,
+        value: f32,
+    },
+    TabletConnected {
+        name: String,
+    },
+    TabletDisconnected,
+    TabletPen {
+        nx: f32,
+        ny: f32,
+        pressure: f32,
+        #[serde(rename = "tiltX")]
+        tilt_x: f32,
+        #[serde(rename = "tiltY")]
+        tilt_y: f32,
+        tip: bool,
+        barrel: bool,
+        #[serde(rename = "secondBarrel")]
+        second_barrel: bool,
+        eraser: bool,
+        #[serde(rename = "inRange")]
+        in_range: bool,
+    },
+    TabletKeys {
+        buttons: u32,
+    },
 }
 
 #[allow(dead_code)]

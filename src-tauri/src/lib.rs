@@ -9,7 +9,11 @@ mod input_hook;
 mod macos_window;
 mod mcp;
 mod obs;
+#[cfg(any(all(windows, not(feature = "win7")), target_os = "macos"))]
+mod peripherals;
 mod privacy;
+#[cfg(windows)]
+mod tablet;
 mod tray;
 mod updater;
 #[cfg(windows)]
@@ -5834,6 +5838,10 @@ pub fn run() {
                 settings_for_setup.clone(),
                 paused_for_setup.clone(),
             );
+            #[cfg(any(all(windows, not(feature = "win7")), target_os = "macos"))]
+            peripherals::start_gamepad_listener(handle.clone());
+            #[cfg(windows)]
+            tablet::start(handle.clone());
             start_hit_test_loop(
                 handle.clone(),
                 settings_for_setup,

@@ -40,6 +40,8 @@ export const TAIL_KEY_PRESETS = {
 } as const;
 
 const EDGE_PROTECTED_WASD_IDS = new Set(['q', 'w', 'e', 'a', 's', 'd', 'z', 'x', 'c', 'space']);
+export type DevicePreviewMode = 'auto' | 'keyboard' | 'tablet' | 'gamepad';
+type ForegroundDevice = Exclude<DevicePreviewMode, 'auto'>;
 
 interface Vec2 {
   x: number;
@@ -57,7 +59,18 @@ interface SmearFrame {
 export type CatHitZone = 'nose' | 'chin' | 'tail' | 'head' | 'body' | null;
 export type PeekEdge = 'none' | 'left' | 'right';
 
-type PawMode = 'idle' | 'curled' | 'poke' | 'mouse' | 'groom' | 'stretch' | 'knead' | 'scruff' | 'peek';
+type PawMode =
+  | 'idle'
+  | 'curled'
+  | 'poke'
+  | 'mouse'
+  | 'groom'
+  | 'stretch'
+  | 'knead'
+  | 'scruff'
+  | 'peek'
+  | 'pad'
+  | 'pen';
 
 interface PawState {
   side: 'left' | 'right';
@@ -84,6 +97,28 @@ interface KeyBubble {
   y: number;
   targetY: number;
   rot: number;
+  createdAt: number;
+  lifetime: number;
+}
+
+interface PadBubble {
+  id: number;
+  label: string;
+  accent: string;
+  x: number;
+  y: number;
+  driftX: number;
+  rot: number;
+  createdAt: number;
+  lifetime: number;
+}
+
+interface TabletBadge {
+  id: number;
+  label: string;
+  accent: string;
+  x: number;
+  y: number;
   createdAt: number;
   lifetime: number;
 }
@@ -198,6 +233,43 @@ interface IdleFidget {
   dur: number;
   side: -1 | 1;
 }
+interface GamepadVisualState {
+  name: string;
+  buttons: number[];
+  triggers: number[];
+  axes: number[];
+  held: boolean[];
+  visible: number;
+  lastActiveAt: number;
+}
+
+const GAMEPAD_BUTTON_SPECS: Record<
+  number,
+  { label: string; accent: string; x: number; y: number }
+> = {
+  0: { label: 'A', accent: '#66d17a', x: -68, y: 16 },
+  1: { label: 'B', accent: '#ff6b6b', x: -82, y: 2 },
+  2: { label: 'Y', accent: '#ffd34d', x: -68, y: -12 },
+  3: { label: 'X', accent: '#5aa9ff', x: -54, y: 2 },
+  4: { label: 'LT', accent: '#c7ccd4', x: -83, y: -34 },
+  5: { label: 'LB', accent: '#c7ccd4', x: -74, y: -27 },
+  6: { label: 'RT', accent: '#c7ccd4', x: 83, y: -34 },
+  7: { label: 'RB', accent: '#c7ccd4', x: 74, y: -27 },
+  8: { label: 'View', accent: '#c7ccd4', x: 14, y: -25 },
+  9: { label: 'Menu', accent: '#c7ccd4', x: 0, y: -25 },
+  10: { label: 'Guide', accent: '#c7ccd4', x: 0, y: -3 },
+  11: { label: 'L3', accent: '#c7ccd4', x: -26, y: 8 },
+  12: { label: 'R3', accent: '#c7ccd4', x: 64, y: 8 },
+  13: { label: 'D↑', accent: '#a8b0bb', x: 30, y: 21 },
+  14: { label: 'D↓', accent: '#a8b0bb', x: 30, y: -5 },
+  15: { label: 'D←', accent: '#a8b0bb', x: 12, y: 8 },
+  16: { label: 'D→', accent: '#a8b0bb', x: 38, y: 8 },
+  17: { label: 'Share', accent: '#c7ccd4', x: -14, y: -25 },
+  19: { label: 'P1', accent: '#c7ccd4', x: 48, y: 38 },
+  20: { label: 'P2', accent: '#c7ccd4', x: 30, y: 44 },
+  21: { label: 'P3', accent: '#c7ccd4', x: -22, y: 44 },
+  22: { label: 'P4', accent: '#c7ccd4', x: -40, y: 38 },
+};
 
 // Exact measured pixel silhouette half-width profile from original video 0.3s (compact chubby sitting cat!)
 // t = 0.0 (ear tips) -> t = 1.0 (bottom base flush on keyboard)
@@ -1030,6 +1102,290 @@ export class KuroCatEngine {
     };
   }
 
+  // ---- Foreground device geometry ----
+
+  private getTabletLayout(): {
+    cx: number;
+    cy: number;
+    w: number;
+    h: number;
+    surfaceCx: number;
+    surfaceCy: number;
+    surfaceW: number;
+    surfaceH: number;
+  } {
+    const is108 = this.keyboardLayout === '108';
+    const w = is108 ? 356 : 244;
+    const h = is108 ? 94 : 74;
+    const cx = this.kbCenterX;
+    const cy = this.kbCenterY + 1;
+    return {
+      cx,
+      cy,
+      w,
+      h,
+      surfaceCx: cx + w * 0.035,
+      surfaceCy: cy + 1,
+      surfaceW: w * 0.70,
+      surfaceH: h * 0.54,
+    };
+  }
+
+  private getGamepadLayout(): { cx: number; cy: number; w: number; h: number; scale: number } {
+    const is108 = this.keyboardLayout === '108';
+    const w = is108 ? 390 : 310;
+    const h = is108 ? 104 : 88;
+    return {
+      cx: this.kbCenterX,
+      cy: this.kbCenterY + 15,
+      w,
+      h,
+      scale: Math.min(w / 300, h / 100),
+    };
+  }
+
+  private getActiveGamepad(): GamepadVisualState | null {
+    if (this.lastPadId !== null) {
+      const active = this.gamepads.get(this.lastPadId);
+      if (active) return active;
+    }
+    const first = this.gamepads.values().next();
+    if (!first.done) return first.value;
+    // Bluetooth gamepads drop out of WinRT enumeration while idle. Keep the
+    // last physical pad on screen until real keyboard/mouse input arrives.
+    if (!this.forcedDevice && this.deviceMode === 'gamepad' && this.lastPhysicalPad) {
+      return this.lastPhysicalPad;
+    }
+    if (this.forcedDevice === 'gamepad' || this.deviceMode === 'gamepad') return this.demoPad;
+    return null;
+  }
+
+  private rememberPhysicalGamepad(pad: GamepadVisualState): void {
+    this.lastPhysicalPad = {
+      name: pad.name,
+      buttons: new Array(24).fill(0),
+      triggers: new Array(4).fill(0),
+      axes: new Array(8).fill(0),
+      held: new Array(24).fill(false),
+      visible: 1,
+      lastActiveAt: pad.lastActiveAt,
+    };
+  }
+
+  private getPenGrip(nibX: number, nibY: number): Vec2 {
+    const dx = this.catCenterX - 4 - nibX + this.penTiltX * 10;
+    const dy = this.catBaseY - 54 - nibY - this.penTiltY * 8;
+    const length = Math.hypot(dx, dy) || 1;
+    const gripLength = this.penTiltX === 0 && this.penTiltY === 0 ? 58 : 56;
+    return {
+      x: nibX + (dx / length) * gripLength,
+      y: nibY + (dy / length) * gripLength,
+    };
+  }
+
+  private getTabletPenPoint(now: number): { x: number; y: number; pressure: number; demo: boolean } {
+    const layout = this.getTabletLayout();
+    const demoPoint = () => {
+      const t = this.elapsed * 0.9;
+      const u = 0.5 + 0.34 * Math.sin(t * 0.95 + 0.4);
+      const v = 0.5 + 0.27 * Math.sin(t * 1.37 + 1.15);
+      return {
+        x: layout.surfaceCx + (u - 0.5) * layout.surfaceW * 0.9,
+        y: layout.surfaceCy + (v - 0.5) * layout.surfaceH * 0.78,
+        pressure: 0.38 + 0.42 * (0.5 + 0.5 * Math.sin(t * 2.2)),
+        demo: true,
+      };
+    };
+
+    // Entering tablet preview without hardware should start the animation immediately
+    // instead of briefly borrowing a stale (or never initialized) real-pen point.
+    if (this.forcedDevice === 'tablet' && !this.penActive && now - this.penLastAt > 3000) {
+      return demoPoint();
+    }
+
+    if (this.penVisible > 0.02) {
+      const fresh = this.tabletHardwareConnected
+        ? this.penActive || now - this.penLastAt < 900
+        : now - this.penPointerAt < 1600 || now - this.penLastAt < 900;
+      if (fresh) {
+        return { x: this.tabletPenX, y: this.tabletPenY, pressure: this.penPressure, demo: false };
+      }
+    }
+
+    if (this.forcedDevice === 'tablet') {
+      return demoPoint();
+    }
+
+    return {
+      x: layout.surfaceCx + layout.surfaceW * 0.34,
+      y: layout.surfaceCy - layout.surfaceH * 0.72,
+      pressure: 0,
+      demo: false,
+    };
+  }
+
+  private updateDeviceVisuals(dt: number, now: number): void {
+    if (
+      this.tabletHardwareConnected &&
+      this.penActive &&
+      now - this.lastNativePenAt > 1200
+    ) {
+      this.penActive = false;
+      this.penDown = false;
+      this.penBarrel = false;
+      this.penSecondBarrel = false;
+      this.penEraser = false;
+      this.penPressure = 0;
+    }
+
+    if (this.forcedDevice === 'tablet') {
+      this.penVisible = 1;
+    } else if (this.deviceMode === 'tablet' && this.tabletHardwareConnected) {
+      // A connected tablet must never borrow the global mouse cursor as a pen.
+      // Keep the nib visible only while the real pen is in range, then let it
+      // settle back onto the bezel instead of freezing at its last hover point.
+      const target = this.penActive ? 1 : 0;
+      this.penVisible += (target - this.penVisible) * (1 - Math.exp(-14 * dt));
+    } else {
+      const pointerActive =
+        this.penActive || now - this.penPointerAt < 1400;
+      this.penVisible += ((pointerActive ? 1 : 0) - this.penVisible) * (1 - Math.exp(-9 * dt));
+    }
+
+    if (this.penTrail.length > 0) {
+      for (const point of this.penTrail) point.a -= dt * 0.42;
+      this.penTrail = this.penTrail.filter((point) => point.a > 0);
+    }
+
+    for (const pad of this.gamepads.values()) {
+      const activePad = this.deviceMode === 'gamepad' ? this.getActiveGamepad() : null;
+      const targetVisible =
+        pad === activePad || now - pad.lastActiveAt < 3200 ? 1 : 0;
+      pad.visible += (targetVisible - pad.visible) * (1 - Math.exp(-6 * dt));
+      for (let i = 0; i < pad.buttons.length; i++) {
+        if (!pad.held[i]) pad.buttons[i] = Math.max(0, pad.buttons[i] - dt * 6);
+      }
+      for (let i = 0; i < pad.triggers.length; i++) {
+        if (!pad.held[i + 4]) pad.triggers[i] = Math.max(0, pad.triggers[i] - dt * 6);
+      }
+    }
+
+    if (
+      this.deviceMode === 'gamepad' &&
+      this.gamepads.size === 0 &&
+      (!this.lastPhysicalPad || this.forcedDevice === 'gamepad')
+    ) {
+      const t = this.elapsed;
+      this.demoPad.axes[0] = Math.sin(t * 0.8) * 0.55;
+      this.demoPad.axes[1] = Math.sin(t * 0.63 + 0.5) * 0.34;
+      this.demoPad.axes[2] = Math.sin(t * 1.05 + 2.1) * 0.5;
+      this.demoPad.axes[3] = Math.sin(t * 0.87 + 0.9) * 0.3;
+      this.demoPad.buttons[0] = Math.sin(t * 2.1) > 0.86 ? 1 : 0;
+      this.demoPad.buttons[1] = Math.sin(t * 1.47 + 1.4) > 0.9 ? 1 : 0;
+      this.demoPad.buttons[3] = Math.sin(t * 1.72 + 2.6) > 0.9 ? 1 : 0;
+      this.demoPad.buttons[13] = Math.sin(t * 1.9) > 0.93 ? 1 : 0;
+      this.demoPad.buttons[14] = Math.sin(t * 2.3 + 2) > 0.94 ? 1 : 0;
+      this.demoPad.triggers[0] = 0.5 + 0.5 * Math.sin(t * 1.1);
+      this.demoPad.triggers[2] = 0.5 + 0.5 * Math.sin(t * 1.4 + 1.8);
+      this.demoPad.visible = 1;
+    }
+
+    if (this.deviceMode === 'gamepad') {
+      const pad = this.getActiveGamepad();
+      if (pad) {
+        this.cursorRelX = Math.max(0.08, Math.min(0.92, 0.5 + (pad.axes[0] ?? 0) * 0.3));
+        this.cursorRelY = Math.max(0.1, Math.min(0.92, 0.62 + (pad.axes[1] ?? 0) * 0.24));
+      }
+    } else if (this.deviceMode === 'tablet') {
+      const pen = this.getTabletPenPoint(now);
+      this.cursorRelX = pen.x / this.logicalW;
+      this.cursorRelY = pen.y / this.logicalH;
+    }
+
+    this.updateDevicePaws(now);
+  }
+
+  private updateDevicePaws(now: number): void {
+    if (this.deviceMode === 'gamepad') {
+      const pad = this.getActiveGamepad();
+      if (!pad) return;
+      const layout = this.getGamepadLayout();
+      const scale = layout.scale;
+      const world = (x: number, y: number): Vec2 => ({
+        x: layout.cx + x * scale,
+        y: layout.cy + y * scale,
+      });
+
+      // Viewer-left paw rests on the left stick / face cluster, viewer-right
+      // paw rests on the right stick / D-pad. The controller body is mirrored
+      // vertically by the renderer, so local +Y becomes screen-up.
+      let leftTarget = world(-26 + (pad.axes[0] ?? 0) * 4.5, -(8 + (pad.axes[1] ?? 0) * 4.5));
+      let rightTarget = world(64 + (pad.axes[2] ?? 0) * 4.5, -(8 + (pad.axes[3] ?? 0) * 4.5));
+
+      if ((pad.buttons[13] ?? 0) > 0.1) rightTarget = world(30, -21);
+      else if ((pad.buttons[14] ?? 0) > 0.1) rightTarget = world(30, 5);
+      else if ((pad.buttons[15] ?? 0) > 0.1) rightTarget = world(12, -8);
+      else if ((pad.buttons[16] ?? 0) > 0.1) rightTarget = world(38, -8);
+
+      const face = [
+        { id: 0, x: -68, y: -16 },
+        { id: 1, x: -82, y: -2 },
+        { id: 2, x: -68, y: 12 },
+        { id: 3, x: -54, y: -2 },
+      ];
+      const pressedFace = face.find((button) => (pad.buttons[button.id] ?? 0) > 0.1);
+      if (pressedFace) leftTarget = world(pressedFace.x, pressedFace.y);
+
+      this.padPressLeft = Math.max(
+        pad.buttons[0] ?? 0,
+        pad.buttons[1] ?? 0,
+        pad.buttons[2] ?? 0,
+        pad.buttons[3] ?? 0,
+        pad.buttons[11] ?? 0,
+        pad.buttons[4] ?? 0,
+        pad.buttons[5] ?? 0,
+        pad.triggers[0] ?? 0,
+      );
+      this.padPressRight = Math.max(
+        pad.buttons[12] ?? 0,
+        pad.buttons[13] ?? 0,
+        pad.buttons[14] ?? 0,
+        pad.buttons[15] ?? 0,
+        pad.buttons[16] ?? 0,
+        pad.buttons[6] ?? 0,
+        pad.buttons[7] ?? 0,
+        pad.triggers[2] ?? 0,
+      );
+
+      this.leftPaw.mode = 'pad';
+      this.rightPaw.mode = 'pad';
+      this.leftPaw.target = leftTarget;
+      this.rightPaw.target = rightTarget;
+      this.leftPaw.lastActiveAt = now;
+      this.rightPaw.lastActiveAt = now;
+      return;
+    }
+
+    this.padPressLeft = 0;
+    this.padPressRight = 0;
+
+    if (this.deviceMode === 'tablet') {
+      const pen = this.getTabletPenPoint(now);
+      const active =
+        this.forcedDevice === 'tablet' || this.penVisible > 0.05 || now - this.penLastAt < 1600;
+      if (active) {
+        this.leftPaw.mode = 'pen';
+        this.leftPaw.target = this.getPenGrip(pen.x, pen.y);
+        this.leftPaw.lastActiveAt = now;
+        if (this.rightPaw.mode !== 'curled' && this.rightPaw.mode !== 'idle') {
+          this.rightPaw.mode = 'curled';
+        }
+      } else if (this.leftPaw.mode === 'pen') {
+        this.leftPaw.mode = 'idle';
+      }
+    }
+  }
+
   // Dynamic logical proportions (65% compact = 420x440; 108-key full-size = 540x456)
   private logicalW = 420;
   private logicalH = 440;
@@ -1077,6 +1433,59 @@ export class KuroCatEngine {
     createdAt: number;
     lifetime: number;
   }> = [];
+
+  // Foreground device: one desk accessory is shown at a time.
+  private deviceMode: ForegroundDevice = 'keyboard';
+  private forcedDevice: ForegroundDevice | null = null;
+
+  // Gamepad state, one pad per connection id. `demoPad` animates when the
+  // user previews a gamepad without hardware connected.
+  private gamepads = new Map<number, GamepadVisualState>();
+  private lastPadId: number | null = null;
+  private lastPhysicalPad: GamepadVisualState | null = null;
+  private demoPad: GamepadVisualState = {
+    name: 'Kuro Pad · DEMO',
+    buttons: new Array(24).fill(0),
+    triggers: new Array(4).fill(0),
+    axes: new Array(8).fill(0),
+    held: new Array(24).fill(false),
+    visible: 1,
+    lastActiveAt: 0,
+  };
+  private padPressLeft = 0;
+  private padPressRight = 0;
+  private lastPadActivityAt = -10000;
+  private lastPadConnectedAt = -10000;
+  private mouseIntentAt = -10000;
+  private mouseIntentX = 0;
+  private mouseIntentY = 0;
+  private mouseIntentDistance = 0;
+  private padBubbles: PadBubble[] = [];
+
+  // Stylus / pen (Pointer Events) drives a held-pen nib + ink trail on the tablet.
+  private penActive = false;
+  private penDown = false;
+  private penBarrel = false;
+  private penSecondBarrel = false;
+  private penEraser = false;
+  private penPressure = 0;
+  private penTiltX = 0;
+  private penTiltY = 0;
+  private penVisible = 0;
+  private penLastAt = -10000;
+  private penPointerAt = -10000;
+  private tabletPenX = 0;
+  private tabletPenY = 0;
+  private penTrail: Array<{ x: number; y: number; p: number; a: number }> = [];
+  private penBadges: TabletBadge[] = [];
+  private tabletKeyBadges: TabletBadge[] = [];
+  private nativeTabletAt = -10000;
+  private lastNativePenAt = -10000;
+  private nativePenSeen = false;
+  private tabletInRange = false;
+  private tabletHardwareConnected = false;
+  private tabletFallbackTimer: number | null = null;
+  private tabletPhysicalKeys = [false, false, false, false];
 
   // Cursor & 100% live eye tracking + 2.5D head turn
   private cursorRelX = 0.5;
@@ -1328,6 +1737,10 @@ export class KuroCatEngine {
     this.directRafPrevMs = 0;
     this.lastRenderMs = 0;
     this.lastRenderPerfMs = 0;
+    if (this.tabletFallbackTimer !== null) {
+      window.clearTimeout(this.tabletFallbackTimer);
+      this.tabletFallbackTimer = null;
+    }
   }
 
   public releaseCachedResources(): void {
@@ -1900,12 +2313,31 @@ export class KuroCatEngine {
   // ---- Input event handlers ----
 
   public onKeyDown(vk: number, repeat: boolean): void {
+    const now = performance.now();
+    const spec = resolveKeyByVk(vk, this.keyboardLayout);
     if (this.privacyMode) {
+      this.setDeviceFromInput('keyboard');
       if (!repeat) this.onPrivacyTyping();
       return;
     }
-    const now = performance.now();
-    const spec = resolveKeyByVk(vk, this.keyboardLayout);
+
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+
+    // Tablets with ExpressKeys usually deliver them as keyboard shortcuts. Keep
+    // the tablet on screen and echo the real shortcut instead of falling back to
+    // the keyboard model the moment the user touches a tablet button.
+    if (this.shouldTreatKeyboardAsTabletExpressKey(now)) {
+      if (!repeat) {
+        if (spec) {
+          const label = formatBubbleForVk(vk, spec);
+          if (label) this.spawnTabletKeyBadge(label, now);
+        }
+        this.bodyBob = Math.min(0.8, this.bodyBob + 0.35);
+      }
+      return;
+    }
+
+    this.setDeviceFromInput('keyboard');
     if (!spec) return;
     this.wakeCat(now, repeat ? 'gentle' : 'abrupt');
 
@@ -1949,6 +2381,8 @@ export class KuroCatEngine {
       this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 320;
     const rawKeyPt = this.getKeyWorldCenter(spec);
     const useTail = this.shouldUseTailForKey(spec, rawKeyPt, activelyMousing, prevAnyKeyAt, now);
+
+    if (this.deviceMode !== 'keyboard') return;
 
     if (this.catBreed === 'dafeiyu') {
       const dafeiyuLayout = this.buildDaFeiYuLayout();
@@ -2139,6 +2573,20 @@ export class KuroCatEngine {
 
   public onGlobalMouseMove(nx: number, ny: number): void {
     const now = performance.now();
+    // Wacom/Windows Ink mirrors the pen as a synthetic mouse. Never let the
+    // global cursor drive the tablet nib: only raw HID or Pointer Events may
+    // move the pen, otherwise the pen visibly fights the tablet.
+    if (now - this.nativeTabletAt < 900) return;
+    if (this.deviceMode === 'tablet') {
+      if (this.tabletHardwareConnected || this.forcedDevice === 'tablet') return;
+      if (now - this.penPointerAt < 1400) return;
+      this.setDeviceFromInput('keyboard');
+      return;
+    }
+    if (now - this.penPointerAt < 600) return;
+    if (this.shouldKeepGamepadOverMouse()) return;
+    this.setDeviceFromInput('keyboard');
+    if (this.deviceMode !== 'keyboard') return;
     const moveDelta = Math.hypot(nx - this.lastMouseNX, ny - this.lastMouseNY);
 
     // Ignore 0px synthetic repeats & tiny optical-sensor micro-jitter (~3-4px; ~7-8px when napping)
@@ -2170,6 +2618,34 @@ export class KuroCatEngine {
 
     this.leftPaw.mode = 'mouse';
     this.leftPaw.lastActiveAt = now;
+  }
+
+  private shouldTreatKeyboardAsTabletExpressKey(now: number): boolean {
+    if (this.deviceMode !== 'tablet') return false;
+    if (this.forcedDevice === 'tablet') return false;
+    if (this.tabletHardwareConnected) {
+      return this.penActive || now - this.nativeTabletAt < 1400;
+    }
+    return now - this.penPointerAt < 1400;
+  }
+
+  private shouldKeepGamepadOverMouse(): boolean {
+    // A connected controller stays in the foreground until the user actually
+    // types or clicks a mouse button. Passive cursor jitter (common while a
+    // Bluetooth pad wakes up) must never push the model back to the keyboard.
+    return (
+      this.deviceMode === 'gamepad' &&
+      (this.gamepads.size > 0 || this.lastPhysicalPad !== null)
+    );
+  }
+
+  private shouldHoldGamepadThroughHandshake(now: number): boolean {
+    return (
+      !this.forcedDevice &&
+      this.deviceMode === 'gamepad' &&
+      this.gamepads.size > 0 &&
+      now - this.lastPadConnectedAt < 1400
+    );
   }
 
   private getMouseButtonColors(): { left: string; right: string; middle: string } {
@@ -2220,6 +2696,22 @@ export class KuroCatEngine {
 
   public onMouseDown(button: string): void {
     const now = performance.now();
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+    if (this.deviceMode === 'tablet') {
+      if (this.forcedDevice === 'tablet') return;
+      if (
+        now - this.nativeTabletAt < 350 ||
+        (this.penActive && now - this.lastNativePenAt < 500)
+      ) {
+        this.handleTabletPointerButton(button, true, now);
+        return;
+      }
+      if (!this.tabletHardwareConnected && now - this.penPointerAt < 1400) {
+        this.handleTabletPointerButton(button, true, now);
+        return;
+      }
+    }
+    this.setDeviceFromInput('keyboard');
     this.wakeCat(now, 'abrupt');
     this.squashSpring.kick(1.2);
     if (button === 'left') {
@@ -2239,6 +2731,7 @@ export class KuroCatEngine {
       this.spawnMouseBadge('middle', now);
     }
 
+    if (this.deviceMode !== 'keyboard') return;
     this.lastMouseMoveAt = now;
     this.lastMouseClickAt = now;
     this.dafeiyu.resetLeftHandForMouse();
@@ -2249,6 +2742,20 @@ export class KuroCatEngine {
   }
 
   public onMouseUp(button: string): void {
+    const now = performance.now();
+    if (this.deviceMode === 'tablet') {
+      if (this.forcedDevice === 'tablet') return;
+      if (
+        this.penDown ||
+        this.penBarrel ||
+        this.penSecondBarrel ||
+        now - this.nativeTabletAt < 500 ||
+        (this.penActive && now - this.lastNativePenAt < 700)
+      ) {
+        this.handleTabletPointerButton(button, false, now);
+        return;
+      }
+    }
     this.wakeAction();
     if (button === 'left') {
       this.mouseLeftDown = false;
@@ -2262,8 +2769,43 @@ export class KuroCatEngine {
     }
   }
 
+  private handleTabletPointerButton(button: string, pressed: boolean, now: number): void {
+    const colors = this.getMouseButtonColors();
+    if (button === 'left') {
+      if (pressed && !this.penDown) {
+        this.penDown = true;
+        this.penPressure = Math.max(this.penPressure, 0.45);
+        this.spawnPenBadge('PEN', colors.left, now);
+        this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
+        if (this.penTrail.length > 140) this.penTrail.shift();
+      } else if (!pressed) {
+        this.penDown = false;
+      }
+    } else if (button === 'right') {
+      if (pressed && !this.penBarrel) this.spawnPenBadge('B1', colors.right, now);
+      this.penBarrel = pressed;
+    } else if (button === 'middle') {
+      if (pressed && !this.penSecondBarrel) this.spawnPenBadge('B2', '#7ac7ff', now);
+      this.penSecondBarrel = pressed;
+    }
+    this.penLastAt = now;
+    this.penVisible = 1;
+    this.leftPaw.mode = 'pen';
+    if (pressed) {
+      this.leftPaw.lastActiveAt = now;
+      if (button === 'left') this.leftPaw.impactSquash = 0.65;
+    }
+  }
+
   public onMouseWheel(): void {
     const now = performance.now();
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+    if (this.deviceMode === 'tablet') {
+      if (this.forcedDevice === 'tablet') return;
+      if (now - this.nativeTabletAt < 350 || this.penActive) return;
+    }
+    this.setDeviceFromInput('keyboard');
+    if (this.deviceMode !== 'keyboard') return;
     this.wakeCat(now, 'abrupt');
     this.mouseScrollFlash = 1;
     this.lastMouseMoveAt = now;
@@ -2272,6 +2814,399 @@ export class KuroCatEngine {
     this.dafeiyu.onMouseAction(now);
     this.leftPaw.mode = 'mouse';
     this.leftPaw.lastActiveAt = now;
+  }
+
+  public setDevicePreview(mode: DevicePreviewMode): void {
+    this.forcedDevice = mode === 'auto' ? null : mode;
+    this.penActive = false;
+    this.penDown = false;
+    this.penBarrel = false;
+    this.penSecondBarrel = false;
+    this.penEraser = false;
+    this.penTrail = [];
+    this.tabletPhysicalKeys = [false, false, false, false];
+    this.tabletInRange = false;
+    if (mode === 'auto') {
+      // With no real input yet, resume the device a fresh connection would
+      // select. This also stops the no-hardware gamepad demo immediately.
+      this.deviceMode = this.gamepads.size > 0 ? 'gamepad' : 'keyboard';
+      this.penVisible = 0;
+      return;
+    }
+    this.deviceMode = mode;
+    this.penLastAt = Math.min(this.penLastAt, performance.now() - 1200);
+    this.leftPaw.mode = 'idle';
+    this.rightPaw.mode = 'idle';
+  }
+
+  private setDeviceFromInput(device: ForegroundDevice): void {
+    if (this.forcedDevice || this.deviceMode === device) return;
+    this.deviceMode = device;
+    if (device !== 'tablet') {
+      this.penTrail = [];
+    }
+    if (device === 'gamepad') {
+      this.cursorRelX = 0.5;
+      this.cursorRelY = 0.6;
+    }
+  }
+
+  // ---- Native tablet (Windows Raw Input HID) ----
+
+  public onTabletConnected(_name: string): void {
+    this.tabletHardwareConnected = true;
+    this.nativePenSeen = false;
+    this.lastNativePenAt = -10000;
+    this.nativeTabletAt = -10000;
+    this.penActive = false;
+    this.penVisible = 0;
+    if (this.tabletFallbackTimer !== null) {
+      window.clearTimeout(this.tabletFallbackTimer);
+      this.tabletFallbackTimer = null;
+    }
+  }
+
+  public onTabletDisconnected(): void {
+    this.tabletHardwareConnected = false;
+    this.nativePenSeen = false;
+    this.lastNativePenAt = -10000;
+    this.tabletInRange = false;
+    this.tabletPhysicalKeys = [false, false, false, false];
+    this.penActive = false;
+    this.penDown = false;
+    this.penBarrel = false;
+    this.penSecondBarrel = false;
+    this.penEraser = false;
+    this.penPressure = 0;
+    this.penVisible = 0;
+    this.penLastAt = performance.now();
+    if (this.tabletFallbackTimer !== null) {
+      window.clearTimeout(this.tabletFallbackTimer);
+      this.tabletFallbackTimer = null;
+    }
+    if (!this.forcedDevice && this.deviceMode === 'tablet') {
+      this.tabletFallbackTimer = window.setTimeout(() => {
+        this.tabletFallbackTimer = null;
+        if (!this.forcedDevice && this.deviceMode === 'tablet') {
+          this.deviceMode = 'keyboard';
+        }
+      }, 1000);
+    }
+  }
+
+  public onTabletPen(
+    nx: number,
+    ny: number,
+    pressure: number,
+    tiltX: number,
+    tiltY: number,
+    tip: boolean,
+    barrel: boolean,
+    secondBarrel: boolean,
+    eraser: boolean,
+    inRange: boolean,
+  ): void {
+    const now = performance.now();
+    this.tabletInRange = inRange;
+    this.penLastAt = now;
+    if (this.tabletFallbackTimer !== null) {
+      window.clearTimeout(this.tabletFallbackTimer);
+      this.tabletFallbackTimer = null;
+    }
+    if (!inRange) {
+      this.updatePenButtons(false, false, false, false, now);
+      this.penActive = false;
+      this.penPressure = 0;
+      return;
+    }
+
+    this.nativeTabletAt = now;
+    this.nativePenSeen = true;
+    this.lastNativePenAt = now;
+    this.setDeviceFromInput('tablet');
+    this.penActive = true;
+    this.penVisible = 1;
+    this.penPressure = Math.max(0, Math.min(1, pressure));
+    this.penTiltX = Math.max(-1, Math.min(1, tiltX));
+    this.penTiltY = Math.max(-1, Math.min(1, tiltY));
+
+    const layout = this.getTabletLayout();
+    const clampedNx = Math.max(0, Math.min(1, nx));
+    const clampedNy = Math.max(0, Math.min(1, ny));
+    this.tabletPenX = layout.surfaceCx + (clampedNx - 0.5) * layout.surfaceW * 0.92;
+    this.tabletPenY = layout.surfaceCy + (clampedNy - 0.5) * layout.surfaceH * 0.82;
+    this.cursorRelX = this.tabletPenX / this.logicalW;
+    this.cursorRelY = this.tabletPenY / this.logicalH;
+    this.leftPaw.lastActiveAt = now;
+
+    this.updatePenButtons(tip, barrel, secondBarrel, eraser, now);
+    if (tip) {
+      const last = this.penTrail[this.penTrail.length - 1];
+      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 1.2) {
+        this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
+        if (this.penTrail.length > 140) this.penTrail.shift();
+      }
+    }
+  }
+
+  public onTabletKeys(buttons: number): void {
+    const now = performance.now();
+    const mask = buttons & 0x0f;
+    const previous = this.tabletPhysicalKeys;
+    const next = [0, 1, 2, 3].map((index) => (mask & (1 << index)) !== 0);
+    this.tabletPhysicalKeys = next;
+    this.nativeTabletAt = now;
+    if (this.tabletFallbackTimer !== null) {
+      window.clearTimeout(this.tabletFallbackTimer);
+      this.tabletFallbackTimer = null;
+    }
+    this.setDeviceFromInput('tablet');
+    for (let index = 0; index < 4; index++) {
+      if (next[index] && !previous[index]) {
+        this.spawnTabletKeyBadge(`K${index + 1}`, now, index);
+      }
+    }
+  }
+
+  // ---- Stylus / pen (Pointer Events from the webview) ----
+
+  public onStylusMove(
+    nx: number,
+    ny: number,
+    pressure: number,
+    tiltX: number,
+    tiltY: number,
+    buttons = 0,
+  ): void {
+    const now = performance.now();
+    if (this.tabletHardwareConnected && now - this.lastNativePenAt < 1500) return;
+    this.setDeviceFromInput('tablet');
+    this.penActive = true;
+    this.penPressure = Math.max(0, Math.min(1, pressure));
+    this.penTiltX = Math.max(-1, Math.min(1, tiltX / 90));
+    this.penTiltY = Math.max(-1, Math.min(1, tiltY / 90));
+    this.penLastAt = now;
+    this.penPointerAt = now;
+    this.penVisible = 1;
+    this.updatePenButtons(
+      (buttons & 1) !== 0,
+      (buttons & 2) !== 0,
+      (buttons & 4) !== 0 || (buttons & 8) !== 0 || (buttons & 16) !== 0,
+      (buttons & 32) !== 0,
+      now,
+    );
+
+    const layout = this.getTabletLayout();
+    const clampedNx = Math.max(0, Math.min(1, nx));
+    const clampedNy = Math.max(0, Math.min(1, ny));
+    this.tabletPenX = layout.surfaceCx + (clampedNx - 0.5) * layout.surfaceW * 0.92;
+    this.tabletPenY = layout.surfaceCy + (clampedNy - 0.5) * layout.surfaceH * 0.82;
+    this.cursorRelX = this.tabletPenX / this.logicalW;
+    this.cursorRelY = this.tabletPenY / this.logicalH;
+    this.leftPaw.lastActiveAt = now;
+
+    if (this.penDown) {
+      const last = this.penTrail[this.penTrail.length - 1];
+      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 1.2) {
+        this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
+        if (this.penTrail.length > 140) this.penTrail.shift();
+      }
+    }
+  }
+
+  public onStylusDown(pressure: number, button = 0): void {
+    const now = performance.now();
+    if (this.tabletHardwareConnected && now - this.lastNativePenAt < 1500) return;
+    this.setDeviceFromInput('tablet');
+    const eraser = button === 5;
+    const barrel = button === 2;
+    const secondBarrel = button === 1;
+    this.updatePenButtons(!barrel && !secondBarrel && !eraser, barrel, secondBarrel, eraser, now);
+    this.penDown = !barrel && !secondBarrel;
+    this.penPressure = Math.max(0, Math.min(1, pressure));
+    this.penVisible = 1;
+    this.penLastAt = now;
+    this.penPointerAt = now;
+    this.leftPaw.mode = 'pen';
+    this.leftPaw.impactSquash = 0.7;
+    if (this.penDown) {
+      this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
+      if (this.penTrail.length > 140) this.penTrail.shift();
+    }
+  }
+
+  public onStylusUp(): void {
+    if (this.tabletHardwareConnected && performance.now() - this.lastNativePenAt < 1500) {
+      return;
+    }
+    this.penDown = false;
+    this.penBarrel = false;
+    this.penSecondBarrel = false;
+    this.penEraser = false;
+    this.penActive = false;
+    this.penPressure = 0;
+    this.penLastAt = performance.now();
+  }
+
+  private updatePenButtons(
+    tip: boolean,
+    barrel: boolean,
+    secondBarrel: boolean,
+    eraser: boolean,
+    now: number,
+  ): void {
+    const colors = this.getMouseButtonColors();
+    if (tip && !this.penDown) this.spawnPenBadge('PEN', colors.left, now);
+    if (barrel && !this.penBarrel) this.spawnPenBadge('B1', colors.right, now);
+    if (secondBarrel && !this.penSecondBarrel) this.spawnPenBadge('B2', '#7ac7ff', now);
+    if (eraser && !this.penEraser) this.spawnPenBadge('ER', '#ff7bb0', now);
+    this.penDown = tip;
+    this.penBarrel = barrel;
+    this.penSecondBarrel = secondBarrel;
+    this.penEraser = eraser;
+  }
+
+  private spawnPenBadge(label: string, accent: string, now: number): void {
+    if (!this.showKeyBubbles || this.privacyMode) return;
+    if (this.penBadges.length >= 3) this.penBadges.shift();
+    this.penBadges.push({
+      id: this.nextBubbleId++,
+      label,
+      accent,
+      x: Math.max(20, Math.min(this.logicalW - 20, this.tabletPenX)),
+      y: Math.max(18, this.tabletPenY - 12),
+      createdAt: now,
+      lifetime: 760,
+    });
+  }
+
+  private spawnTabletKeyBadge(label: string, now: number, keyIndex?: number): void {
+    if (!this.showKeyBubbles || this.privacyMode) return;
+    const layout = this.getTabletLayout();
+    if (this.tabletKeyBadges.length >= 3) this.tabletKeyBadges.shift();
+    const keyX = layout.cx - layout.w * 0.385;
+    const keyY = layout.cy - layout.h * 0.35 + (keyIndex ?? 0) * layout.h * 0.125;
+    this.tabletKeyBadges.push({
+      id: this.nextBubbleId++,
+      label,
+      accent: this.getMouseButtonColors().left,
+      x: keyIndex === undefined ? layout.cx - layout.w * 0.38 : keyX,
+      y: keyIndex === undefined ? layout.cy - layout.h * 0.52 : keyY,
+      createdAt: now,
+      lifetime: 860,
+    });
+  }
+
+  // ---- Gamepad (WinRT RawGameController on Windows, gilrs on macOS) ----
+
+  public onGamepadConnected(id: number, name: string): void {
+    const existing = this.gamepads.get(id);
+    if (!existing) {
+      this.gamepads.set(id, {
+        name,
+        buttons: new Array(24).fill(0),
+        triggers: new Array(4).fill(0),
+        axes: new Array(8).fill(0),
+        held: new Array(24).fill(false),
+        visible: 1,
+        lastActiveAt: performance.now(),
+      });
+    } else {
+      existing.name = name;
+    }
+    this.lastPadId = id;
+    this.lastPhysicalPad = this.gamepads.get(id)!;
+    const now = performance.now();
+    this.lastPadActivityAt = now;
+    this.lastPadConnectedAt = now;
+    this.mouseIntentAt = -10000;
+    this.mouseIntentDistance = 0;
+    this.setDeviceFromInput('gamepad');
+  }
+
+  public onGamepadDisconnected(id: number): void {
+    const removed = this.gamepads.get(id);
+    if (removed) this.rememberPhysicalGamepad(removed);
+    this.gamepads.delete(id);
+    if (this.lastPadId === id) {
+      const next = this.gamepads.keys().next();
+      this.lastPadId = next.done ? null : next.value;
+    }
+  }
+
+  public onGamepadButton(id: number, button: number, pressed: boolean, value: number): void {
+    let pad = this.gamepads.get(id);
+    if (!pad) {
+      this.onGamepadConnected(id, 'Gamepad');
+      pad = this.gamepads.get(id)!;
+    }
+    const now = performance.now();
+    const level = Math.max(0, Math.min(1, value));
+    const down = pressed || level > 0.06;
+    const wasHeld = button >= 0 && button < pad.held.length ? pad.held[button] : false;
+    if (button >= 4 && button <= 7) pad.triggers[button - 4] = level;
+    if (button >= 0 && button < pad.buttons.length) pad.buttons[button] = level;
+    if (button >= 0 && button < pad.held.length) {
+      pad.held[button] = pressed || (button >= 4 && button <= 7 && level > 0.02);
+    }
+    pad.visible = 1;
+    pad.lastActiveAt = now;
+    if (pressed || level > 0.05) this.lastPadActivityAt = now;
+    this.lastPadId = id;
+    this.setDeviceFromInput('gamepad');
+
+    if (down && !wasHeld) this.spawnPadBubble(button, now);
+
+    if (!down) return;
+    this.bodyBob = Math.min(1.15, this.bodyBob + 0.5);
+    if (Math.random() < 0.4) {
+      if (Math.random() < 0.5) this.earTwitchLeft = 1;
+      else this.earTwitchRight = 1;
+    }
+  }
+
+  public onGamepadAxis(id: number, axis: number, value: number): void {
+    let pad = this.gamepads.get(id);
+    if (!pad) {
+      this.onGamepadConnected(id, 'Gamepad');
+      pad = this.gamepads.get(id)!;
+    }
+    if (axis >= 0 && axis < pad.axes.length) pad.axes[axis] = value;
+    const now = performance.now();
+    const wasTriggerHeld =
+      axis === 4 ? (pad.held[4] ?? false) : axis === 5 ? (pad.held[6] ?? false) : false;
+    let triggerButton: number | null = null;
+    if (axis === 4) {
+      pad.triggers[0] = Math.max(0, Math.min(1, value));
+      pad.held[4] = value > 0.02;
+      triggerButton = 4;
+    } else if (axis === 5) {
+      pad.triggers[2] = Math.max(0, Math.min(1, value));
+      pad.held[6] = value > 0.02;
+      triggerButton = 6;
+    }
+    // gilrs/WGI reports the analog triggers as axes rather than button edges.
+    // Spawn the LT/RT bubble on the rising edge so they behave like the face
+    // and shoulder buttons.
+    if (triggerButton !== null && pad.held[triggerButton] && !wasTriggerHeld) {
+      this.spawnPadBubble(triggerButton, now);
+    }
+    // Any axis event proves the controller is alive again. Switching on the
+    // event itself (instead of requiring a large deflection) lets a sleeping
+    // Bluetooth pad reclaim the foreground after the user typed or clicked.
+    this.lastPadId = id;
+    this.setDeviceFromInput('gamepad');
+    if (Math.abs(value) > 0.02) {
+      pad.visible = 1;
+      pad.lastActiveAt = now;
+      const meaningful = axis <= 3 ? Math.abs(value) > 0.12 : Math.abs(value) > 0.05;
+      if (meaningful) this.lastPadActivityAt = now;
+    }
+
+    if (axis === 0 || axis === 1) {
+      this.cursorRelX = Math.max(0.08, Math.min(0.92, 0.5 + pad.axes[0] * 0.3));
+      this.cursorRelY = Math.max(0.1, Math.min(0.92, 0.62 + pad.axes[1] * 0.24));
+    }
   }
 
   private resetPetStrokes(): void {
@@ -2533,6 +3468,25 @@ export class KuroCatEngine {
     }
   }
 
+  private spawnPadBubble(button: number, now: number): void {
+    if (!this.showKeyBubbles || this.privacyMode) return;
+    const spec = GAMEPAD_BUTTON_SPECS[button];
+    if (!spec) return;
+    const layout = this.getGamepadLayout();
+    if (this.padBubbles.length >= 6) this.padBubbles.shift();
+    this.padBubbles.push({
+      id: this.nextBubbleId++,
+      label: spec.label,
+      accent: spec.accent,
+      x: layout.cx + spec.x * layout.scale,
+      y: layout.cy - spec.y * layout.scale - 13,
+      driftX: (Math.random() - 0.5) * 6,
+      rot: ((Math.random() - 0.5) * 4 * Math.PI) / 180,
+      createdAt: now,
+      lifetime: 820,
+    });
+  }
+
   // ---- Simulation update ----
 
   private update(dt: number, now: number): void {
@@ -2600,6 +3554,11 @@ export class KuroCatEngine {
     }
     this.mouseScrollFlash = Math.max(0, this.mouseScrollFlash - dt * 4.5);
     this.mouseBadges = this.mouseBadges.filter((b) => now - b.createdAt < b.lifetime);
+    this.padBubbles = this.padBubbles.filter((b) => now - b.createdAt < b.lifetime);
+    this.penBadges = this.penBadges.filter((b) => now - b.createdAt < b.lifetime);
+    this.tabletKeyBadges = this.tabletKeyBadges.filter((b) => now - b.createdAt < b.lifetime);
+
+    this.updateDeviceVisuals(dt, now);
 
     while (this.recentKeyTimes.length > 0 && now - this.recentKeyTimes[0] > 950) {
       this.recentKeyTimes.shift();
@@ -2982,8 +3941,12 @@ export class KuroCatEngine {
     this.bodyBob = Math.max(0, this.bodyBob - dt * 11.5);
     this.kbBounce = Math.max(0, this.kbBounce - dt * 15);
 
-    // Playful left-right body & head groove sway during pure typing (damped cleanly while peeking so head stays centered between paws!)
-    const pureTypingActive = !peekWanted && isTypingRecently && this.leftPaw.mode !== 'mouse';
+    // Playful left-right body & head groove sway during pure typing (damped while peeking).
+    const pureTypingActive =
+      !peekWanted &&
+      this.deviceMode === 'keyboard' &&
+      isTypingRecently &&
+      this.leftPaw.mode !== 'mouse';
     if (pureTypingActive) {
       this.typingGroovePhase += dt * (4.8 + this.typingEnergy * 5.2);
     }
@@ -2991,11 +3954,13 @@ export class KuroCatEngine {
     const kneadSway = this.kneadAmount > 0.05 ? Math.sin(this.kneadPhase) * 0.22 * this.kneadAmount : 0;
     const targetTypingSway = peekWanted
       ? 0
-      : pureTypingActive
-        ? Math.max(-1.1, Math.min(1.1, grooveWave * 0.72 + this.lastKeyBias * 0.55))
-        : this.leftPaw.mode === 'mouse' && isTypingRecently
-          ? Math.sin(this.typingGroovePhase) * 0.16
-          : kneadSway;
+      : this.deviceMode !== 'keyboard'
+        ? 0
+        : pureTypingActive
+          ? Math.max(-1.1, Math.min(1.1, grooveWave * 0.72 + this.lastKeyBias * 0.55))
+          : this.leftPaw.mode === 'mouse' && isTypingRecently
+            ? Math.sin(this.typingGroovePhase) * 0.16
+            : kneadSway;
     const swayAcc = (targetTypingSway * peekCalm - this.typingSway) * 118 - this.typingSwayVel * 12.5;
     this.typingSwayVel += swayAcc * dt;
     this.typingSway = Math.max(-1.2, Math.min(1.2, this.typingSway + this.typingSwayVel * dt));
@@ -3007,6 +3972,15 @@ export class KuroCatEngine {
       targetLean = this.rightPaw.mode === 'poke'
         ? -0.52 + mouseSweepBias
         : -0.96 + mouseSweepBias;
+    } else if (!peekWanted && this.deviceMode === 'gamepad') {
+      const pad = this.getActiveGamepad();
+      const stickX = pad ? (pad.axes[0] ?? 0) : 0;
+      targetLean = Math.max(-0.36, Math.min(0.36, stickX * 0.24));
+    } else if (!peekWanted && this.deviceMode === 'tablet') {
+      targetLean = Math.max(
+        -0.2,
+        Math.min(0.2, (this.getTabletPenPoint(now).x - this.logicalW * 0.5) / 300),
+      );
     } else if (!peekWanted && this.catTail.reach > 0.05) {
       const tailDir = Math.max(-1, Math.min(1, (this.catTail.tipX - this.catCenterX) / (this.kbWidth * 0.5)));
       targetLean = tailDir * 0.14 * this.catTail.reach;
@@ -3388,6 +4362,9 @@ export class KuroCatEngine {
       paw.mode = heldKey ? 'poke' : 'idle';
     }
 
+    if (paw.mode === 'pad' && this.deviceMode !== 'gamepad') paw.mode = 'idle';
+    if (paw.mode === 'pen' && this.deviceMode !== 'tablet') paw.mode = 'idle';
+
     if (paw.mode === 'mouse') {
       const lrBias = this.mouseLeftPress - this.mouseRightPress;
       const anyClickPress = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
@@ -3456,6 +4433,8 @@ export class KuroCatEngine {
           ? 32
           : paw.mode === 'groom' || paw.mode === 'knead' || paw.mode === 'scruff'
             ? 24
+            : paw.mode === 'pad' || paw.mode === 'pen'
+              ? 36
             : 22;
     const follow = 1 - Math.exp(-followRate * dt);
     paw.pos.x += (paw.target.x - paw.pos.x) * follow;
@@ -3517,15 +4496,14 @@ export class KuroCatEngine {
       this.dafeiyu.renderBody(ctx, now, layout, peekP);
       ctx.restore();
 
-      // Layer 2: Mini mouse & mechanical keyboard (slide & fade cleanly away in Edge Peek Mode)
+      // Layer 2: Foreground desk device (slide & fade cleanly away in Edge Peek Mode)
       if (peekP < 0.78) {
         ctx.save();
         if (peekP > 0.01) {
           ctx.globalAlpha = Math.max(0, 1 - peekP * 1.35);
           ctx.translate(0, peekP * 54);
         }
-        this.drawMiniMouse(ctx);
-        this.drawKeyboard(ctx);
+        this.drawDeskDevice(ctx);
         ctx.restore();
       }
 
@@ -3542,6 +4520,7 @@ export class KuroCatEngine {
           ctx.globalAlpha = Math.max(0, 1 - peekP * 3.0);
         }
         this.dafeiyu.renderForeground(ctx, this.lastDt, now, layout);
+        if (this.deviceMode === 'gamepad') this.drawGamepadStickRings(ctx);
         ctx.restore();
       }
 
@@ -3558,16 +4537,23 @@ export class KuroCatEngine {
         this.dafeiyu.renderEdgePeekHands(ctx, edgeX, midY, isLeft, peekP, now);
       }
 
-      // Layer 5: Keycap bubbles & mouse click badges (hidden while peeking)
+      // Layer 5: Device bubbles (hidden while peeking)
       if (this.showKeyBubbles && !this.privacyMode && peekP < 0.4) {
-        this.drawKeyBubbles(ctx);
-        this.drawMouseBadges(ctx);
+        if (this.deviceMode === 'keyboard') {
+          this.drawKeyBubbles(ctx);
+          this.drawMouseBadges(ctx);
+        } else if (this.deviceMode === 'gamepad') {
+          this.drawPadBubbles(ctx);
+        } else if (this.deviceMode === 'tablet') {
+          this.drawTabletBadges(ctx);
+        }
       }
+      if (this.deviceMode === 'tablet' && peekP < 0.4) this.drawTabletPen(ctx);
       ctx.restore();
       return;
     }
 
-    // Layer 1: Mini mouse & mechanical keyboard (slide & fade cleanly away in Edge Peek Mode!)
+    // Layer 1: Foreground desk device (slide & fade cleanly away in Edge Peek Mode!)
     const peekP = Math.max(0, Math.min(1, this.peekAmount));
     if (peekP < 0.78) {
       ctx.save();
@@ -3575,8 +4561,7 @@ export class KuroCatEngine {
         ctx.globalAlpha = Math.max(0, 1 - peekP * 1.35);
         ctx.translate(0, peekP * 54);
       }
-      this.drawMiniMouse(ctx);
-      this.drawKeyboard(ctx);
+      this.drawDeskDevice(ctx);
       ctx.restore();
     }
 
@@ -3603,6 +4588,8 @@ export class KuroCatEngine {
     // Layer 4: True-scale velvety cat paws (tapered idle legs / edge-gripping peek paws / poking / grooming!)
     this.drawPaw(ctx, this.leftPaw, breath);
     this.drawPaw(ctx, this.rightPaw, breath);
+    if (this.deviceMode === 'gamepad') this.drawGamepadStickRings(ctx);
+    if (this.deviceMode === 'tablet') this.drawTabletPen(ctx);
 
     // Layer 4.5: Alive cat comic FX (anger 💢 mark, tail-slam starburst & dust puffs, sleepy Zzz, chin hearts, groom sparkles)
     this.drawCatAliveFx(ctx, performance.now(), breath);
@@ -3615,8 +4602,14 @@ export class KuroCatEngine {
 
     // Layer 5: Organic bouncing 3D keycap bubbles & crisp mouse click badges (hidden while peeking)
     if (this.showKeyBubbles && !this.privacyMode && peekP < 0.4) {
-      this.drawKeyBubbles(ctx);
-      this.drawMouseBadges(ctx);
+      if (this.deviceMode === 'keyboard') {
+        this.drawKeyBubbles(ctx);
+        this.drawMouseBadges(ctx);
+      } else if (this.deviceMode === 'gamepad') {
+        this.drawPadBubbles(ctx);
+      } else if (this.deviceMode === 'tablet') {
+        this.drawTabletBadges(ctx);
+      }
     }
 
     ctx.restore();
@@ -5774,11 +6767,17 @@ export class KuroCatEngine {
     if (activeArmWeight > 0.05) {
       const sh = this.getLiveShoulder(paw, breath);
       const px = paw.pos.x;
-      const mouseClickDrop =
+      const actionPress =
         paw.mode === 'mouse'
-          ? Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress) * 1.8
-          : 0;
-      const py = paw.pos.y + mouseClickDrop;
+          ? Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress)
+          : paw.mode === 'pen'
+            ? this.penPressure
+            : paw.mode === 'pad'
+              ? paw.side === 'left'
+                ? this.padPressLeft
+                : this.padPressRight
+              : 0;
+      const py = paw.pos.y + actionPress * 1.8;
 
       ctx.save();
       ctx.globalAlpha = Math.min(1, activeArmWeight * 1.2);
@@ -5947,6 +6946,95 @@ export class KuroCatEngine {
     }
   }
 
+  private drawBadgeKeycap(
+    ctx: CanvasRenderingContext2D,
+    label: string,
+    accent: string,
+    x: number,
+    y: number,
+    alpha: number,
+    scale: number,
+    rot: number,
+  ): void {
+    if (alpha <= 0.01) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+
+    ctx.font = `700 ${label.length > 2 ? 10 : 11.5}px "Segoe UI", system-ui, sans-serif`;
+    const textW = ctx.measureText(label).width;
+    const boxW = Math.max(27, textW + 15);
+    const boxH = 22;
+    const bx = -boxW / 2;
+    const by = -boxH / 2;
+
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.24)';
+    ctx.shadowBlur = 5;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = accent;
+    this.roundRect(ctx, bx, by + 2.2, boxW, boxH, 5.5);
+    ctx.fill();
+
+    ctx.shadowBlur = 0;
+    const face = ctx.createLinearGradient(0, by, 0, by + boxH);
+    face.addColorStop(0, '#ffffff');
+    face.addColorStop(1, '#f2f3f1');
+    ctx.fillStyle = face;
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.05;
+    this.roundRect(ctx, bx, by, boxW, boxH - 1.3, 5.5);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = accent;
+    this.roundRect(ctx, bx + 4.5, by + 2.4, boxW - 9, 2.2, 1.1);
+    ctx.fill();
+
+    ctx.fillStyle = '#1e2025';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, 0, 1.1);
+    ctx.restore();
+  }
+
+  private drawPadBubbles(ctx: CanvasRenderingContext2D): void {
+    const now = performance.now();
+    for (const b of this.padBubbles) {
+      const t = Math.min(1, (now - b.createdAt) / b.lifetime);
+      const pop = t < 0.13 ? 0.7 + Math.sin((t / 0.13) * Math.PI * 0.55) * 0.38 : 1;
+      const fade = t < 0.7 ? 1 : Math.max(0, 1 - (t - 0.7) / 0.3);
+      const rise = 30 * (1 - (1 - t) * (1 - t));
+      this.drawBadgeKeycap(
+        ctx,
+        b.label,
+        b.accent,
+        b.x + b.driftX * t,
+        b.y - rise,
+        fade,
+        pop,
+        b.rot,
+      );
+    }
+  }
+
+  private drawTabletBadges(ctx: CanvasRenderingContext2D): void {
+    const now = performance.now();
+    for (const b of this.penBadges) {
+      const t = Math.min(1, (now - b.createdAt) / b.lifetime);
+      const pop = t < 0.14 ? 0.68 + Math.sin((t / 0.14) * Math.PI * 0.55) * 0.4 : 1;
+      const fade = t < 0.68 ? 1 : Math.max(0, 1 - (t - 0.68) / 0.32);
+      this.drawBadgeKeycap(ctx, b.label, b.accent, b.x, b.y - 22 * t, fade, pop, -0.03);
+    }
+    for (const b of this.tabletKeyBadges) {
+      const t = Math.min(1, (now - b.createdAt) / b.lifetime);
+      const pop = t < 0.14 ? 0.68 + Math.sin((t / 0.14) * Math.PI * 0.55) * 0.4 : 1;
+      const fade = t < 0.68 ? 1 : Math.max(0, 1 - (t - 0.68) / 0.32);
+      this.drawBadgeKeycap(ctx, b.label, b.accent, b.x, b.y - 24 * t, fade, pop, 0.02);
+    }
+  }
+
   private drawMouseBadges(ctx: CanvasRenderingContext2D): void {
     const now = performance.now();
     for (let i = 0; i < this.mouseBadges.length; i++) {
@@ -5997,6 +7085,597 @@ export class KuroCatEngine {
 
       ctx.restore();
     }
+  }
+
+  // ---- Stylus / ink / gamepad device visuals ----
+
+  private drawDeskDevice(ctx: CanvasRenderingContext2D): void {
+    if (this.deviceMode === 'gamepad') {
+      this.drawGamepadModel(ctx);
+    } else if (this.deviceMode === 'tablet') {
+      this.drawTablet(ctx);
+    } else {
+      this.drawMiniMouse(ctx);
+      this.drawKeyboard(ctx);
+    }
+  }
+
+  private drawTablet(ctx: CanvasRenderingContext2D): void {
+    const layout = this.getTabletLayout();
+    const { cx, cy, w, h } = layout;
+    const halfH = h / 2;
+    const topHalfW = w * 0.465;
+    const botHalfW = w * 0.515;
+    const colors = this.getMouseButtonColors();
+    const pen = this.getTabletPenPoint(performance.now());
+    const pressure = this.forcedDevice === 'tablet' || this.penVisible > 0.04
+      ? pen.pressure
+      : this.penPressure;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // Cable peeking out from the top edge.
+    ctx.save();
+    ctx.strokeStyle = '#14161a';
+    ctx.lineWidth = 3.2;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(w * 0.18, -halfH - 1);
+    ctx.bezierCurveTo(w * 0.31, -halfH - 10, w * 0.46, -halfH - 9, w * 0.57, -halfH + 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // Slab shadow and graphite body.
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.36)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle = '#101216';
+    this.trapezoidPath(ctx, topHalfW + 2, botHalfW + 2, -halfH + 3, halfH + 4, 9);
+    ctx.fill();
+    ctx.restore();
+
+    const bodyGrad = ctx.createLinearGradient(0, -halfH, 0, halfH);
+    bodyGrad.addColorStop(0, '#2e323a');
+    bodyGrad.addColorStop(0.55, '#20242a');
+    bodyGrad.addColorStop(1, '#15181d');
+    ctx.fillStyle = bodyGrad;
+    ctx.strokeStyle = '#3c4048';
+    ctx.lineWidth = 1.1;
+    this.trapezoidPath(ctx, topHalfW, botHalfW, -halfH, halfH, 8);
+    ctx.fill();
+    ctx.stroke();
+
+    // Soft top sheen.
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-topHalfW * 0.62, -halfH + 4);
+    ctx.quadraticCurveTo(0, -halfH + 1.5, topHalfW * 0.62, -halfH + 4);
+    ctx.stroke();
+
+    // Drawing surface.
+    const sx = layout.surfaceCx - cx;
+    const sy = layout.surfaceCy - cy;
+    const sw = layout.surfaceW;
+    const sh = layout.surfaceH;
+    const surfaceGrad = ctx.createLinearGradient(0, sy - sh / 2, 0, sy + sh / 2);
+    surfaceGrad.addColorStop(0, '#3a3e46');
+    surfaceGrad.addColorStop(1, '#292d34');
+    ctx.fillStyle = surfaceGrad;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.13)';
+    ctx.lineWidth = 1;
+    this.roundRect(ctx, sx - sw / 2, sy - sh / 2, sw, sh, 6);
+    ctx.fill();
+    ctx.stroke();
+
+    // Express keys on the left bezel.
+    const keyX = -w * 0.425;
+    for (let i = 0; i < 4; i++) {
+      const keyY = -halfH * 0.48 + i * (h * 0.125);
+      ctx.fillStyle = this.tabletPhysicalKeys[i] ? colors.left : '#3a3f48';
+      this.roundRect(ctx, keyX, keyY, Math.max(3.5, w * 0.028), h * 0.09, 1.6);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+    ctx.font = '600 4.4px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('KURO', keyX + w * 0.014, halfH - 9);
+
+    // Pressure meter on the lower right bezel.
+    const meterX = sx + sw * 0.24;
+    const meterY = halfH - 8;
+    ctx.fillStyle = '#16191d';
+    this.roundRect(ctx, meterX, meterY, sw * 0.24, 4, 2);
+    ctx.fill();
+    if (pressure > 0.02) {
+      ctx.fillStyle = colors.left;
+      this.roundRect(ctx, meterX, meterY, sw * 0.24 * Math.min(1, pressure), 4, 2);
+      ctx.fill();
+    }
+
+    // USB-C port and DEMO badge.
+    ctx.fillStyle = '#0e1013';
+    this.roundRect(ctx, -7, -halfH + 1.5, 14, 3.2, 1.6);
+    ctx.fill();
+    if (this.forcedDevice === 'tablet') {
+      ctx.strokeStyle = colors.left;
+      ctx.fillStyle = 'rgba(20, 22, 26, 0.72)';
+      ctx.lineWidth = 0.8;
+      this.roundRect(ctx, topHalfW - 34, -halfH + 4, 30, 9, 4.5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = colors.left;
+      ctx.font = '700 5.4px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText('DEMO', topHalfW - 19, -halfH + 8.6);
+    }
+
+    ctx.restore();
+    this.drawTabletInk(ctx, layout);
+  }
+
+  private drawTabletInk(
+    ctx: CanvasRenderingContext2D,
+    layout: ReturnType<KuroCatEngine['getTabletLayout']>,
+  ): void {
+    const colors = this.getMouseButtonColors();
+    const left = layout.surfaceCx - layout.surfaceW / 2;
+    const top = layout.surfaceCy - layout.surfaceH / 2;
+
+    ctx.save();
+    this.roundRect(ctx, left, top, layout.surfaceW, layout.surfaceH, 6);
+    ctx.clip();
+
+    // Faint dot grid makes the tablet surface read as a drawing area.
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.055)';
+    for (let x = left + 8; x < left + layout.surfaceW - 4; x += 13) {
+      for (let y = top + 7; y < top + layout.surfaceH - 4; y += 11) {
+        ctx.fillRect(x, y, 0.8, 0.8);
+      }
+    }
+
+    const now = performance.now();
+    const demoActive = this.forcedDevice === 'tablet' && now - this.penLastAt > 3000;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = colors.left;
+
+    if (demoActive) {
+      const t = this.elapsed;
+      let previous: { x: number; y: number; p: number } | null = null;
+      for (let i = 62; i >= 0; i--) {
+        const sample = t - i * 0.022;
+        const u = 0.5 + 0.34 * Math.sin(sample * 0.95 + 0.4);
+        const v = 0.5 + 0.27 * Math.sin(sample * 1.37 + 1.15);
+        const point = {
+          x: layout.surfaceCx + (u - 0.5) * layout.surfaceW * 0.9,
+          y: layout.surfaceCy + (v - 0.5) * layout.surfaceH * 0.78,
+          p: 0.38 + 0.42 * (0.5 + 0.5 * Math.sin(sample * 2.2)),
+        };
+        if (previous) {
+          ctx.globalAlpha = (1 - i / 63) * 0.9;
+          ctx.lineWidth = 1 + ((previous.p + point.p) * 0.5) * 3.2;
+          ctx.beginPath();
+          ctx.moveTo(previous.x, previous.y);
+          ctx.lineTo(point.x, point.y);
+          ctx.stroke();
+        }
+        previous = point;
+      }
+    } else if (this.penTrail.length > 1) {
+      for (let i = 1; i < this.penTrail.length; i++) {
+        const a = this.penTrail[i - 1];
+        const b = this.penTrail[i];
+        const alpha = Math.min(a.a, b.a);
+        if (alpha <= 0.02) continue;
+        ctx.globalAlpha = Math.min(1, alpha) * 0.92;
+        ctx.lineWidth = 1 + ((a.p + b.p) * 0.5) * 5;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+  }
+
+  private drawTabletPen(ctx: CanvasRenderingContext2D): void {
+    const layout = this.getTabletLayout();
+    const colors = this.getMouseButtonColors();
+    const now = performance.now();
+    const active = this.forcedDevice === 'tablet' || this.penVisible > 0.03;
+
+    if (!active) {
+      // Pen resting along the top-right bezel when idle.
+      ctx.save();
+      ctx.translate(layout.surfaceCx + layout.surfaceW * 0.3, layout.cy - layout.h * 0.33);
+      ctx.rotate(-0.1);
+      ctx.globalAlpha = 0.78;
+      ctx.fillStyle = '#252932';
+      this.roundRect(ctx, 0, -2.2, 44, 4.4, 2.2);
+      ctx.fill();
+      ctx.fillStyle = colors.right;
+      this.roundRect(ctx, 31, -2.6, 7, 5.2, 2.2);
+      ctx.fill();
+      ctx.fillStyle = '#e7e9ee';
+      ctx.beginPath();
+      ctx.moveTo(-5, 0);
+      ctx.lineTo(0, -1.7);
+      ctx.lineTo(0, 1.7);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    const pen = this.getTabletPenPoint(now);
+    const grip = this.getPenGrip(pen.x, pen.y);
+    const dx = grip.x - pen.x;
+    const dy = grip.y - pen.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const ux = dx / length;
+    const uy = dy / length;
+    const px = -uy;
+    const py = ux;
+    const capX = grip.x + ux * 12;
+    const capY = grip.y + uy * 12;
+    const alpha = this.forcedDevice === 'tablet' ? 1 : Math.max(0, this.penVisible);
+    const pressure = pen.pressure;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    if (pressure > 0.02) {
+      const glow = ctx.createRadialGradient(pen.x, pen.y, 0, pen.x, pen.y, 9 + pressure * 9);
+      glow.addColorStop(0, colors.left);
+      glow.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.globalAlpha = alpha * (0.3 + pressure * 0.45);
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(pen.x, pen.y, 9 + pressure * 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = alpha;
+    }
+
+    // Dark tapered barrel with a slim accent ring near the grip.
+    ctx.beginPath();
+    ctx.moveTo(pen.x + px * 1.8, pen.y + py * 1.8);
+    ctx.lineTo(capX + px * 4.4, capY + py * 4.4);
+    ctx.lineTo(capX - px * 4.4, capY - py * 4.4);
+    ctx.lineTo(pen.x - px * 1.8, pen.y - py * 1.8);
+    ctx.closePath();
+    const barrel = ctx.createLinearGradient(pen.x, pen.y, capX, capY);
+    barrel.addColorStop(0, '#3c414b');
+    barrel.addColorStop(1, '#1e2127');
+    ctx.fillStyle = barrel;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.lineWidth = 0.8;
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.strokeStyle = colors.right;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(grip.x + px * 4.2, grip.y + py * 4.2);
+    ctx.lineTo(grip.x - px * 4.2, grip.y - py * 4.2);
+    ctx.stroke();
+
+    // Real pen barrel buttons sit just below the grip ring.
+    const drawPenButton = (inset: number, pressed: boolean, color: string) => {
+      const bx = grip.x - ux * inset + px * 4.0;
+      const by = grip.y - uy * inset + py * 4.0;
+      ctx.fillStyle = pressed ? color : '#111318';
+      ctx.strokeStyle = pressed ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = pressed ? 1 : 0.7;
+      ctx.beginPath();
+      ctx.arc(bx, by, 2.25, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    };
+    drawPenButton(7, this.penBarrel, colors.right);
+    drawPenButton(16, this.penSecondBarrel, '#7ac7ff');
+
+    // Cap and metal nib; the eraser end mirrors the real inverted pen state.
+    ctx.fillStyle = this.penEraser ? '#ff7bb0' : '#2b2f37';
+    ctx.beginPath();
+    ctx.arc(capX, capY, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+    if (this.penEraser) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+      ctx.lineWidth = 0.9;
+      ctx.stroke();
+    }
+    ctx.fillStyle = this.penEraser ? '#ffd0e0' : '#e7e9ee';
+    ctx.beginPath();
+    ctx.arc(pen.x, pen.y, 1.7 + pressure * 1.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  private drawGamepadModel(ctx: CanvasRenderingContext2D): void {
+    const pad = this.getActiveGamepad();
+    if (!pad || pad.visible < 0.03) return;
+    const layout = this.getGamepadLayout();
+    const colors = this.getMouseButtonColors();
+    const scale = layout.scale;
+    const intensity = Math.max(
+      0,
+      ...pad.buttons.slice(0, 17),
+      pad.triggers[0] ?? 0,
+      pad.triggers[2] ?? 0,
+      Math.abs(pad.axes[0] ?? 0),
+      Math.abs(pad.axes[1] ?? 0),
+      Math.abs(pad.axes[2] ?? 0),
+      Math.abs(pad.axes[3] ?? 0),
+    );
+    const rumbleX = intensity > 0.35 ? Math.sin(this.elapsed * 46) * intensity * 0.7 : 0;
+    const rumbleY = intensity > 0.35 ? Math.cos(this.elapsed * 39) * intensity * 0.45 : 0;
+
+    const bodyPath = () => {
+      ctx.beginPath();
+      ctx.moveTo(-52, -30);
+      ctx.quadraticCurveTo(0, -40, 52, -30);
+      ctx.bezierCurveTo(86, -30, 112, -22, 126, 0);
+      ctx.bezierCurveTo(142, 26, 140, 48, 118, 49);
+      ctx.bezierCurveTo(96, 50, 80, 34, 64, 30);
+      ctx.bezierCurveTo(40, 36, -40, 36, -64, 30);
+      ctx.bezierCurveTo(-80, 34, -96, 50, -118, 49);
+      ctx.bezierCurveTo(-140, 48, -142, 26, -126, 0);
+      ctx.bezierCurveTo(-112, -22, -86, -30, -52, -30);
+      ctx.closePath();
+    };
+
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, pad.visible);
+    ctx.translate(layout.cx + rumbleX, layout.cy + rumbleY);
+    ctx.rotate(-0.012);
+    ctx.scale(scale, -scale);
+
+    const fillUprightText = (text: string, x: number, y: number) => {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(1, -1);
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    };
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.42)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 5;
+    ctx.fillStyle = '#0d0f12';
+    ctx.save();
+    ctx.translate(0, 2);
+    bodyPath();
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
+
+    // Triggers peek out behind the body.
+    const drawTrigger = (x: number, level: number, label: string) => {
+      ctx.fillStyle = '#171a1f';
+      this.roundRect(ctx, x, -43, 30, 13, 4.5);
+      ctx.fill();
+      if (level > 0.02) {
+        ctx.fillStyle = colors.left;
+        this.roundRect(ctx, x + 1.2, -41.8, 27.6 * Math.min(1, level), 10.6, 3.6);
+        ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.62)';
+      ctx.font = '700 5px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      fillUprightText(label, x + 15, -36.2);
+    };
+    drawTrigger(-98, Math.max(pad.buttons[4] ?? 0, pad.triggers[0] ?? 0), 'LT');
+    drawTrigger(68, Math.max(pad.buttons[6] ?? 0, pad.triggers[2] ?? 0), 'RT');
+
+    const shell = ctx.createLinearGradient(0, -40, 0, 50);
+    shell.addColorStop(0, '#3a3f49');
+    shell.addColorStop(0.35, '#2a2e36');
+    shell.addColorStop(1, '#16191e');
+    bodyPath();
+    ctx.fillStyle = shell;
+    ctx.strokeStyle = '#4c515c';
+    ctx.lineWidth = 1.2;
+    ctx.fill();
+    ctx.stroke();
+
+    // Top edge sheen.
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-46, -31);
+    ctx.quadraticCurveTo(0, -39, 46, -31);
+    ctx.stroke();
+
+    // Bumpers sit on the top edge.
+    const drawBumper = (x: number, level: number, label: string) => {
+      ctx.fillStyle = level > 0.1 ? colors.left : '#23272e';
+      this.roundRect(ctx, x, -32, 40, 9, 4);
+      ctx.fill();
+      ctx.fillStyle = level > 0.1 ? '#12151a' : 'rgba(255, 255, 255, 0.46)';
+      ctx.font = '700 5.4px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      fillUprightText(label, x + 20, -27.2);
+    };
+    drawBumper(-94, pad.buttons[5] ?? 0, 'LB');
+    drawBumper(54, pad.buttons[7] ?? 0, 'RB');
+
+    const drawStick = (
+      baseX: number,
+      baseY: number,
+      axisX: number,
+      axisY: number,
+      pressed: boolean,
+    ) => {
+      const x = baseX + axisX * 5;
+      const y = baseY + axisY * 5;
+      ctx.fillStyle = '#111318';
+      ctx.beginPath();
+      ctx.arc(baseX, baseY, 15.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.11)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      const knob = ctx.createRadialGradient(x - 2.5, y - 3.5, 1, x, y, 11);
+      knob.addColorStop(0, '#555b66');
+      knob.addColorStop(1, '#2a2e36');
+      ctx.fillStyle = knob;
+      ctx.beginPath();
+      ctx.arc(x, y, 10.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = pressed ? colors.left : '#4b505a';
+      ctx.lineWidth = pressed ? 1.8 : 1;
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+      ctx.lineWidth = 0.9;
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.arc(x, y, 6.8, -0.8 + i * 0.85, 0.35 + i * 0.85);
+        ctx.stroke();
+      }
+    };
+    drawStick(-26, 8, pad.axes[0] ?? 0, pad.axes[1] ?? 0, (pad.buttons[11] ?? 0) > 0.1);
+    drawStick(64, 8, pad.axes[2] ?? 0, pad.axes[3] ?? 0, (pad.buttons[12] ?? 0) > 0.1);
+
+    // D-pad.
+    const dpadX = 30;
+    const dpadY = 8;
+    const dpadLevels = [13, 14, 15, 16].map((id) => pad.buttons[id] ?? 0);
+    ctx.fillStyle = '#191c21';
+    this.roundRect(ctx, dpadX - 19, dpadY - 6.5, 38, 13, 3);
+    ctx.fill();
+    this.roundRect(ctx, dpadX - 6.5, dpadY - 19, 13, 38, 3);
+    ctx.fill();
+    const dpadArm = (x: number, y: number, w: number, h: number, level: number) => {
+      ctx.fillStyle = level > 0.1 ? colors.left : '#353a43';
+      this.roundRect(ctx, x, y, w, h, 2);
+      ctx.fill();
+    };
+    dpadArm(dpadX - 5, dpadY + 8.5, 10, 10, dpadLevels[0]);
+    dpadArm(dpadX - 5, dpadY - 18.5, 10, 10, dpadLevels[1]);
+    dpadArm(dpadX - 18.5, dpadY - 5, 10, 10, dpadLevels[2]);
+    dpadArm(dpadX + 8.5, dpadY - 5, 10, 10, dpadLevels[3]);
+
+    // Face buttons.
+    const face = [
+      { id: 2, x: -68, y: -12, color: '#ffd34d', label: 'Y' },
+      { id: 1, x: -82, y: 2, color: '#ff6b6b', label: 'B' },
+      { id: 0, x: -68, y: 16, color: '#66d17a', label: 'A' },
+      { id: 3, x: -54, y: 2, color: '#5aa9ff', label: 'X' },
+    ];
+    for (const button of face) {
+      const level = pad.buttons[button.id] ?? 0;
+      ctx.beginPath();
+      ctx.arc(button.x, button.y, 8.2, 0, Math.PI * 2);
+      ctx.fillStyle = level > 0.1 ? button.color : '#252930';
+      ctx.fill();
+      ctx.strokeStyle = level > 0.1 ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.13)';
+      ctx.lineWidth = level > 0.1 ? 1.4 : 0.8;
+      ctx.stroke();
+      ctx.fillStyle = level > 0.1 ? '#12151a' : 'rgba(255, 255, 255, 0.52)';
+      ctx.font = '800 7px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      fillUprightText(button.label, button.x, button.y + 0.2);
+    }
+
+    // Center menu buttons and paw logo.
+    const menu = [
+      { id: 8, x: 14 },
+      { id: 9, x: 0 },
+      { id: 17, x: -14 },
+    ];
+    for (const item of menu) {
+      const level = pad.buttons[item.id] ?? 0;
+      ctx.fillStyle = level > 0.1 ? colors.right : '#3a3f48';
+      this.roundRect(ctx, item.x - 1.8, -22, 3.6, 6, 1.5);
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = colors.left;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(0, -3, 7.2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = colors.left;
+    for (const [toeX, toeY, radius] of [
+      [-3.2, -6.2, 1.5],
+      [0, -7.1, 1.7],
+      [3.2, -6.2, 1.5],
+    ]) {
+      ctx.beginPath();
+      ctx.arc(toeX, toeY, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.ellipse(0, -1.5, 4.2, 3.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Connection LED and player badge.
+    const ledPulse = 0.55 + 0.45 * Math.sin(this.elapsed * 4.2);
+    ctx.fillStyle = `rgba(120, 235, 150, ${ledPulse.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(-118, -23, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.font = '700 5.4px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    fillUprightText(pad === this.demoPad ? 'DEMO' : `PAD ${pad.name.slice(0, 14)}`, -112, -58);
+
+    if (pad === this.demoPad) {
+      ctx.strokeStyle = colors.left;
+      ctx.fillStyle = 'rgba(18, 20, 24, 0.7)';
+      ctx.lineWidth = 0.8;
+      this.roundRect(ctx, -76, -53, 32, 10, 5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = colors.left;
+      ctx.font = '700 5.4px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      fillUprightText('DEMO', -60, -48.5);
+    }
+
+    ctx.restore();
+  }
+
+  private drawGamepadStickRings(ctx: CanvasRenderingContext2D): void {
+    if (this.deviceMode !== 'gamepad') return;
+    const pad = this.getActiveGamepad();
+    if (!pad || pad.visible < 0.03) return;
+    const layout = this.getGamepadLayout();
+    const colors = this.getMouseButtonColors();
+    const sticks = [
+      { x: -26, y: 8, accent: (pad.buttons[11] ?? 0) > 0.1 },
+      { x: 64, y: 8, accent: (pad.buttons[12] ?? 0) > 0.1 },
+    ];
+
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, pad.visible) * 0.9;
+    for (const stick of sticks) {
+      const sx = layout.cx + stick.x * layout.scale;
+      const sy = layout.cy - stick.y * layout.scale;
+      const radius = 12.4 * layout.scale;
+      ctx.strokeStyle = stick.accent ? colors.left : 'rgba(205, 213, 226, 0.52)';
+      ctx.lineWidth = stick.accent ? 2.2 : 1.5;
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.34)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius - 1.4, Math.PI * 1.05, Math.PI * 1.42);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private drawCustomCatBody(

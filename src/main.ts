@@ -5,6 +5,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   DEFAULT_TAIL_KEY_IDS,
   KuroCatEngine,
+  type DevicePreviewMode,
   type KeyboardOrientation,
   type PeekEdge,
   type TailKeyMode,
@@ -72,7 +73,27 @@ type InputEvent =
   | { kind: 'mouseUp'; button: string }
   | { kind: 'mouseWheel'; delta: number }
   | { kind: 'mouseMove'; x: number; y: number; nx: number; ny: number }
-  | { kind: 'privacyTyping' };
+  | { kind: 'privacyTyping' }
+  | { kind: 'gamepadConnected'; id: number; name: string }
+  | { kind: 'gamepadDisconnected'; id: number }
+  | { kind: 'gamepadButton'; id: number; button: number; pressed: boolean; value: number }
+  | { kind: 'gamepadAxis'; id: number; axis: number; value: number }
+  | { kind: 'tabletConnected'; name: string }
+  | { kind: 'tabletDisconnected' }
+  | {
+      kind: 'tabletPen';
+      nx: number;
+      ny: number;
+      pressure: number;
+      tiltX: number;
+      tiltY: number;
+      tip: boolean;
+      barrel: boolean;
+      secondBarrel: boolean;
+      eraser: boolean;
+      inRange: boolean;
+    }
+  | { kind: 'tabletKeys'; buttons: number };
 
 interface WindowCursorInfo {
   relX: number;
@@ -1360,6 +1381,12 @@ async function bootstrap(): Promise<void> {
     return (normX * 2 - 1) * 0.35;
   };
 
+  await listen<DevicePreviewMode>('kuro-device-preview', (ev) => {
+    const mode = ev.payload;
+    if (mode === 'auto' || mode === 'keyboard' || mode === 'tablet' || mode === 'gamepad') {
+      engine.setDevicePreview(mode);
+    }
+  });
   await listen<InputEvent>('kuro-input', (ev) => {
     const p = ev.payload;
     switch (p.kind) {
@@ -1429,6 +1456,41 @@ async function bootstrap(): Promise<void> {
       case 'privacyTyping':
         if (active3d && engine3d) engine3d.onPrivacyTyping();
         else engine.onPrivacyTyping();
+        break;
+      case 'gamepadConnected':
+        engine.onGamepadConnected(p.id, p.name);
+        break;
+      case 'gamepadDisconnected':
+        engine.onGamepadDisconnected(p.id);
+        break;
+      case 'gamepadButton':
+        engine.onGamepadButton(p.id, p.button, p.pressed, p.value);
+        break;
+      case 'gamepadAxis':
+        engine.onGamepadAxis(p.id, p.axis, p.value);
+        break;
+      case 'tabletConnected':
+        engine.onTabletConnected(p.name);
+        break;
+      case 'tabletDisconnected':
+        engine.onTabletDisconnected();
+        break;
+      case 'tabletPen':
+        engine.onTabletPen(
+          p.nx,
+          p.ny,
+          p.pressure,
+          p.tiltX,
+          p.tiltY,
+          p.tip,
+          p.barrel,
+          p.secondBarrel,
+          p.eraser,
+          p.inRange,
+        );
+        break;
+      case 'tabletKeys':
+        engine.onTabletKeys(p.buttons);
         break;
     }
   });
@@ -1552,6 +1614,7 @@ async function bootstrap(): Promise<void> {
   });
 
   // Left-click: quick tap (< 4px / < 220ms) pokes nose/tail/chin/head; drag >= 4px enters scruffed drag mode!
+  let activeStylusPointerId: number | null = null;
   const usesNativeDrag = isWindowsPlatform() || isMacPlatform();
   let resolveLinuxMouseUp: (() => void) | null = null;
   const waitForFallbackMouseUp = (): Promise<void> =>
@@ -1749,6 +1812,7 @@ async function bootstrap(): Promise<void> {
     if (tailPickerOpen) {
       closeTailPicker();
     }
+    if (performance.now() - lastPenPointerAt < 1500) return;
     if (settings.clickThroughLocked && !altOverride && !e.altKey) return;
     openContextMenu(e.clientX, e.clientY);
   };
@@ -1764,6 +1828,54 @@ async function bootstrap(): Promise<void> {
   canvas3dDblClickListener = handleCanvasDblClick;
   canvas.addEventListener('dblclick', handleCanvasDblClick);
   bindCanvas3dListeners(canvas3d);
+
+  // Stylus / pen support (Pointer Events) with real pressure + tilt → held-pen + ink trail
+  let lastPenPointerAt = -10000;
+  const readPenInput = (e: PointerEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      nx: (e.clientX - rect.left) / Math.max(1, rect.width),
+      ny: (e.clientY - rect.top) / Math.max(1, rect.height),
+      tiltX: Number.isFinite(e.tiltX) ? e.tiltX : 0,
+      tiltY: Number.isFinite(e.tiltY) ? e.tiltY : 0,
+    };
+  };
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (e.pointerType !== 'pen') return;
+    lastPenPointerAt = performance.now();
+    const p = readPenInput(e);
+    engine.onStylusMove(p.nx, p.ny, e.pressure, p.tiltX, p.tiltY, e.buttons);
+  });
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'pen' || !e.isPrimary) return;
+    lastPenPointerAt = performance.now();
+    activeStylusPointerId = e.pointerId;
+    canvas.setPointerCapture(e.pointerId);
+    // Seed the nib position before the first dot: a quick tap can arrive
+    // without a preceding pointermove, which would otherwise ink at (0, 0).
+    const p = readPenInput(e);
+    engine.onStylusMove(p.nx, p.ny, e.pressure, p.tiltX, p.tiltY, e.buttons);
+    engine.onStylusDown(e.pressure, e.button);
+    e.preventDefault();
+  });
+  const endPen = (e: PointerEvent) => {
+    if (e.pointerId !== activeStylusPointerId) return;
+    activeStylusPointerId = null;
+    engine.onStylusUp();
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener('pointerup', endPen);
+  canvas.addEventListener('pointercancel', endPen);
+  canvas.addEventListener('lostpointercapture', endPen);
+  canvas.addEventListener('pointerleave', (e) => {
+    if (e.pointerType === 'pen' && activeStylusPointerId === null) engine.onStylusUp();
+  });
+  window.addEventListener('blur', () => {
+    if (activeStylusPointerId === null) return;
+    activeStylusPointerId = null;
+    engine.onStylusUp();
+  });
 
   // Side menu window auto-closes on its own focus loss; do NOT close on main blur (clicking the menu blurs main!)
   window.addEventListener('keydown', (e) => {
