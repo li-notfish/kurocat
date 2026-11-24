@@ -1501,6 +1501,10 @@ export class KuroCatEngine {
   private tabletPenX = 0;
   private tabletPenY = 0;
   private penTrail: Array<{ x: number; y: number; p: number; a: number }> = [];
+  // Scratch buckets for the ink trail, reused so the render loop does not
+  // allocate every frame.
+  private inkBuckets: number[][] = [];
+  private inkBucketAlpha: number[] = [];
   private penBadges: TabletBadge[] = [];
   private tabletKeyBadges: TabletBadge[] = [];
   private nativeTabletAt = -10000;
@@ -7399,42 +7403,87 @@ export class KuroCatEngine {
 
     if (demoActive) {
       const t = this.elapsed;
-      let previous: { x: number; y: number; p: number } | null = null;
+      const demo: Array<{ x: number; y: number; p: number; a: number }> = [];
       for (let i = 62; i >= 0; i--) {
         const sample = t - i * 0.022;
         const u = 0.5 + 0.34 * Math.sin(sample * 0.95 + 0.4);
         const v = 0.5 + 0.27 * Math.sin(sample * 1.37 + 1.15);
-        const point = {
+        demo.push({
           x: layout.surfaceCx + (u - 0.5) * layout.surfaceW * 0.9,
           y: layout.surfaceCy + (v - 0.5) * layout.surfaceH * 0.78,
           p: 0.38 + 0.42 * (0.5 + 0.5 * Math.sin(sample * 2.2)),
-        };
-        if (previous) {
-          ctx.globalAlpha = (1 - i / 63) * 0.9;
-          ctx.lineWidth = 1 + ((previous.p + point.p) * 0.5) * 3.2;
-          ctx.beginPath();
-          ctx.moveTo(previous.x, previous.y);
-          ctx.lineTo(point.x, point.y);
-          ctx.stroke();
-        }
-        previous = point;
+          a: 1 - i / 63,
+        });
       }
+      this.strokeInkTrail(ctx, demo, 3.2, 0.9);
     } else if (this.penTrail.length > 1) {
-      for (let i = 1; i < this.penTrail.length; i++) {
-        const a = this.penTrail[i - 1];
-        const b = this.penTrail[i];
-        const alpha = Math.min(a.a, b.a);
-        if (alpha <= 0.02) continue;
-        ctx.globalAlpha = Math.min(1, alpha) * 0.92;
-        ctx.lineWidth = 1 + ((a.p + b.p) * 0.5) * 5;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
-        ctx.stroke();
-      }
+      this.strokeInkTrail(ctx, this.penTrail, 5, 0.92);
     }
 
     ctx.restore();
+  }
+
+  /**
+   * Strokes the ink trail in a handful of batches.
+   *
+   * Every segment used to be stroked on its own. A full trail holds 140
+   * points, so that was 139 canvas calls per frame and the renderer lost
+   * 20-40 ms per frame on it - the cat visibly stuttered while the user was
+   * drawing. The segments are grouped by alpha instead, which keeps the fade
+   * but turns the whole trail into a couple of strokes.
+   */
+  private strokeInkTrail(
+    ctx: CanvasRenderingContext2D,
+    points: Array<{ x: number; y: number; p: number; a: number }>,
+    widthScale: number,
+    alphaScale: number,
+  ): void {
+    const BUCKETS = 8;
+    if (points.length < 2) return;
+    if (this.inkBuckets.length !== BUCKETS) {
+      this.inkBuckets.length = 0;
+      this.inkBucketAlpha.length = 0;
+      for (let i = 0; i < BUCKETS; i++) {
+        this.inkBuckets.push([]);
+        this.inkBucketAlpha.push(0);
+      }
+    } else {
+      for (const bucket of this.inkBuckets) bucket.length = 0;
+      for (let i = 0; i < BUCKETS; i++) this.inkBucketAlpha[i] = 0;
+    }
+
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1];
+      const b = points[i];
+      const alpha = Math.min(a.a, b.a);
+      if (alpha <= 0.02) continue;
+      const bucket = Math.min(BUCKETS - 1, Math.floor(alpha * BUCKETS));
+      this.inkBuckets[bucket].push(i);
+      this.inkBucketAlpha[bucket] += alpha;
+    }
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let bucket = 0; bucket < BUCKETS; bucket++) {
+      const indices = this.inkBuckets[bucket];
+      if (indices.length === 0) continue;
+      let width = 0;
+      let previousIndex = -2;
+      ctx.beginPath();
+      for (const index of indices) {
+        const a = points[index - 1];
+        const b = points[index];
+        // Segments that follow each other become one continuous polyline, so
+        // a whole bucket needs a single moveTo instead of one per segment.
+        if (index !== previousIndex + 1) ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        previousIndex = index;
+        width += 1 + ((a.p + b.p) * 0.5) * widthScale;
+      }
+      ctx.globalAlpha = Math.min(1, this.inkBucketAlpha[bucket] / indices.length) * alphaScale;
+      ctx.lineWidth = width / indices.length;
+      ctx.stroke();
+    }
   }
 
   private drawTabletPen(ctx: CanvasRenderingContext2D): void {
