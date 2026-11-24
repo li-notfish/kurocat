@@ -495,13 +495,17 @@ let diagLongFrameCount = 0;
 let diagPenEvents = 0;
 let diagMaxPenGapMs = 0;
 let diagLastPenAt = 0;
+let diagPenDown = false;
 
-function noteTabletPenArrival(): void {
+function noteTabletPenArrival(tip: boolean): void {
   const now = performance.now();
-  if (diagLastPenAt > 0) {
+  // Only a gap inside a stroke says something about the pen stream. The time
+  // between two strokes is the user's own pause and would drown the signal.
+  if (diagPenDown && diagLastPenAt > 0) {
     const gap = now - diagLastPenAt;
     if (gap > diagMaxPenGapMs) diagMaxPenGapMs = gap;
   }
+  diagPenDown = tip;
   diagLastPenAt = now;
   diagPenEvents += 1;
 }
@@ -1525,7 +1529,7 @@ async function bootstrap(): Promise<void> {
         engine.onTabletDisconnected();
         break;
       case 'tabletPen':
-        noteTabletPenArrival();
+        noteTabletPenArrival(p.tip);
         engine.onTabletPen(
           p.nx,
           p.ny,

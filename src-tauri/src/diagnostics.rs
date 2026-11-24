@@ -31,6 +31,10 @@ pub static PEN_REPORTS: AtomicU64 = AtomicU64::new(0);
 pub static PEN_EMITS: AtomicU64 = AtomicU64::new(0);
 /// Pen samples replaced by a newer one before they could be emitted.
 pub static PEN_COALESCED: AtomicU64 = AtomicU64::new(0);
+/// Pen samples dropped because the nib did not move far enough.
+pub static PEN_UNCHANGED: AtomicU64 = AtomicU64::new(0);
+/// Pen samples dropped because the previous one was still too recent.
+pub static PEN_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 /// Nib transitions.
 pub static PEN_TIP_DOWN: AtomicU64 = AtomicU64::new(0);
 pub static PEN_TIP_UP: AtomicU64 = AtomicU64::new(0);
@@ -228,6 +232,8 @@ struct Snapshot {
     pen_reports: u64,
     pen_emits: u64,
     pen_coalesced: u64,
+    pen_unchanged: u64,
+    pen_rate_limited: u64,
     pen_tip_down: u64,
     pen_tip_up: u64,
     mouse_seen: u64,
@@ -243,6 +249,8 @@ fn snapshot() -> Snapshot {
         pen_reports: PEN_REPORTS.load(Ordering::Relaxed),
         pen_emits: PEN_EMITS.load(Ordering::Relaxed),
         pen_coalesced: PEN_COALESCED.load(Ordering::Relaxed),
+        pen_unchanged: PEN_UNCHANGED.load(Ordering::Relaxed),
+        pen_rate_limited: PEN_RATE_LIMITED.load(Ordering::Relaxed),
         pen_tip_down: PEN_TIP_DOWN.load(Ordering::Relaxed),
         pen_tip_up: PEN_TIP_UP.load(Ordering::Relaxed),
         mouse_seen: MOUSE_MOVES_SEEN.load(Ordering::Relaxed),
@@ -260,6 +268,10 @@ impl Snapshot {
             pen_reports: self.pen_reports.saturating_sub(previous.pen_reports),
             pen_emits: self.pen_emits.saturating_sub(previous.pen_emits),
             pen_coalesced: self.pen_coalesced.saturating_sub(previous.pen_coalesced),
+            pen_unchanged: self.pen_unchanged.saturating_sub(previous.pen_unchanged),
+            pen_rate_limited: self
+                .pen_rate_limited
+                .saturating_sub(previous.pen_rate_limited),
             pen_tip_down: self.pen_tip_down.saturating_sub(previous.pen_tip_down),
             pen_tip_up: self.pen_tip_up.saturating_sub(previous.pen_tip_up),
             mouse_seen: self.mouse_seen.saturating_sub(previous.mouse_seen),
@@ -282,12 +294,14 @@ fn summary_line(elapsed_ms: u64, delta: Snapshot) -> String {
     let gap = RENDER_MAX_GAP_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     let pen_gap = FRONTEND_PEN_GAP_MAX_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     format!(
-        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_tip={}/{} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
+        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_unch={} pen_rlmt={} pen_tip={}/{} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
         timestamp(),
         elapsed_ms,
         rate(delta.pen_reports),
         rate(delta.pen_emits),
         delta.pen_coalesced,
+        delta.pen_unchanged,
+        delta.pen_rate_limited,
         delta.pen_tip_down,
         delta.pen_tip_up,
         rate(delta.mouse_seen),
@@ -346,6 +360,8 @@ mod tests {
             pen_reports,
             pen_emits,
             pen_coalesced: 0,
+            pen_unchanged: 0,
+            pen_rate_limited: 0,
             pen_tip_down: 0,
             pen_tip_up: 0,
             mouse_seen: 0,

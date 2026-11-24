@@ -53,6 +53,13 @@ const PEN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 // the sampler would forward that noise to the webview as a continuous stream
 // of events and starve the renderer.
 const PEN_MOVE_EPSILON: f32 = 1.0 / 512.0;
+// While the nib is down that dead zone is far too wide: 1/512 of the tablet
+// is roughly half a millimetre, so a slow stroke has to travel that far
+// before a single sample is forwarded. The cat's nib then trails the real
+// one by hundreds of milliseconds and the stroke looks like it stutters.
+// Drawing therefore uses a much finer threshold, so the nib follows the real
+// stroke at the full sample rate.
+const PEN_MOVE_EPSILON_ACTIVE: f32 = 1.0 / 8192.0;
 // The nib's range state is latched: as soon as any of the proximity signals
 // fires the pen counts as being on the tablet and it stays there until the
 // reports go quiet. Firmware generations disagree about the status byte and a
@@ -68,6 +75,12 @@ const PEN_MOUSE_SUPPRESS_WINDOW: Duration = Duration::from_millis(400);
 // the untouched input path. The pause runs on a deadline, so a lost pen
 // report can never switch the hooks off for good.
 const PEN_DRAWING_PAUSE_WINDOW: Duration = Duration::from_millis(400);
+// The hooks stay paused a little longer after the nib lifted. Installing and
+// removing a low level hook takes the win32k loader lock and every other
+// process has to wait for it - that is what made the drawing application
+// stutter. A short linger turns a sequence of strokes into a single install
+// and a single removal instead of one pair per stroke.
+const PEN_DRAWING_PAUSE_LINGER: Duration = Duration::from_millis(3000);
 
 /// Latched "is the pen on the tablet" state.
 #[derive(Debug, Default)]
@@ -184,6 +197,9 @@ struct TabletContext {
     connected: HashSet<String>,
     /// Whether the global hooks are currently paused because the nib is down.
     drawing_pause_active: bool,
+    /// When the drawing pause may end again. The pause follows the pen
+    /// session, not the individual stroke.
+    drawing_pause_until: Option<Instant>,
     /// Whether the nib was down during the previous update.
     pen_tip_down: bool,
 }
@@ -246,6 +262,7 @@ fn run(app: AppHandle) {
         paths: HashMap::new(),
         connected: HashSet::new(),
         drawing_pause_active: false,
+        drawing_pause_until: None,
         pen_tip_down: false,
     };
     scan_initial_devices(&mut context);
@@ -1262,11 +1279,11 @@ fn pen_controls_changed(previous: PenSample, next: PenSample) -> bool {
         || previous.in_range != next.in_range
 }
 
-fn pen_moved(previous: PenSample, next: PenSample) -> bool {
+fn pen_moved(previous: PenSample, next: PenSample, epsilon: f32) -> bool {
     // A nib that rests on the tablet still reports tiny jitter. Only a real
     // displacement or a pressure change is worth forwarding to the webview.
-    (previous.nx - next.nx).abs() > PEN_MOVE_EPSILON
-        || (previous.ny - next.ny).abs() > PEN_MOVE_EPSILON
+    (previous.nx - next.nx).abs() > epsilon
+        || (previous.ny - next.ny).abs() > epsilon
         || (previous.pressure - next.pressure).abs() > 0.02
 }
 
@@ -1277,14 +1294,22 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     let controls_changed = device
         .last_sample
         .map_or(true, |previous| pen_controls_changed(previous, sample));
+    // A drawing nib uses the fine threshold so the cat follows the real
+    // stroke, a hovering nib keeps the wide jitter filter.
+    let epsilon = if sample.tip {
+        PEN_MOVE_EPSILON_ACTIVE
+    } else {
+        PEN_MOVE_EPSILON
+    };
     let moved = device
         .last_sample
-        .map_or(true, |previous| pen_moved(previous, sample));
+        .map_or(true, |previous| pen_moved(previous, sample, epsilon));
     let unchanged = !moved && !controls_changed;
     let heartbeat_due =
         unchanged && sample.in_range && device.last_emit.elapsed() >= PEN_HEARTBEAT_INTERVAL;
     if unchanged && !heartbeat_due {
         device.pending_sample = None;
+        crate::diagnostics::PEN_UNCHANGED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -1293,6 +1318,7 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
         return;
     }
     if !controls_changed && device.last_emit.elapsed() < PEN_EMIT_INTERVAL {
+        crate::diagnostics::PEN_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -1346,12 +1372,26 @@ fn update_pen_activity(context: &mut TabletContext, tip_down: bool) {
         crate::input_hook::suppress_mouse_moves_for(PEN_MOUSE_SUPPRESS_WINDOW);
     }
 
-    let should_pause = tip_down && pause_hooks_while_drawing(&context.app);
+    // The pause follows the pen session, not the individual stroke. Toggling
+    // the global hooks on every stroke takes the win32k loader lock dozens of
+    // times per minute and every other process has to wait for it - that is
+    // what made the drawing application stutter. The hooks now stay off for
+    // the whole burst of strokes and come back once the nib rested for a
+    // moment.
+    let setting_on = pause_hooks_while_drawing(&context.app);
+    if setting_on && tip_down {
+        context.drawing_pause_until = Some(Instant::now() + PEN_DRAWING_PAUSE_LINGER);
+    }
+    let should_pause = setting_on
+        && context
+            .drawing_pause_until
+            .map_or(false, |until| Instant::now() < until);
     if should_pause {
         // The pause runs on a deadline that every fresh pen report extends.
         crate::input_hook::refresh_drawing_pause(PEN_DRAWING_PAUSE_WINDOW);
     } else if context.drawing_pause_active {
         crate::input_hook::set_drawing_pause(false);
+        context.drawing_pause_until = None;
     }
     context.drawing_pause_active = should_pause;
 }
@@ -1712,8 +1752,28 @@ mod tests {
         };
         let moved = PenSample { nx: 0.5, ..base };
 
-        assert!(!pen_moved(base, jitter));
-        assert!(pen_moved(base, moved));
+        assert!(!pen_moved(base, jitter, PEN_MOVE_EPSILON));
+        assert!(pen_moved(base, moved, PEN_MOVE_EPSILON));
+    }
+
+    #[test]
+    fn a_drawing_nib_follows_fractions_of_a_millimetre() {
+        let base = PenSample {
+            nx: 0.4,
+            ny: 0.4,
+            pressure: 0.2,
+            tip: true,
+            in_range: true,
+            ..PenSample::default()
+        };
+        let slow = PenSample {
+            nx: 0.4 + PEN_MOVE_EPSILON_ACTIVE * 2.0,
+            ..base
+        };
+
+        // The hover filter swallows the movement, the drawing filter keeps it.
+        assert!(!pen_moved(base, slow, PEN_MOVE_EPSILON));
+        assert!(pen_moved(base, slow, PEN_MOVE_EPSILON_ACTIVE));
     }
 
     #[test]

@@ -3088,7 +3088,7 @@ export class KuroCatEngine {
     this.updatePenButtons(tip, barrel, secondBarrel, eraser, now);
     if (tip) {
       const last = this.penTrail[this.penTrail.length - 1];
-      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 1.2) {
+      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 0.5) {
         this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
         if (this.penTrail.length > 140) this.penTrail.shift();
       }
@@ -3159,7 +3159,7 @@ export class KuroCatEngine {
 
     if (this.penDown) {
       const last = this.penTrail[this.penTrail.length - 1];
-      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 1.2) {
+      if (!last || Math.hypot(this.tabletPenX - last.x, this.tabletPenY - last.y) > 0.5) {
         this.penTrail.push({ x: this.tabletPenX, y: this.tabletPenY, p: this.penPressure, a: 1 });
         if (this.penTrail.length > 140) this.penTrail.shift();
       }
