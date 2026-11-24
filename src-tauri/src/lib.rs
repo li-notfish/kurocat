@@ -5865,6 +5865,10 @@ pub fn run() {
             tablet::start(handle.clone());
             diagnostics::set_enabled(s.diagnostics_enabled);
             diagnostics::start();
+            diagnostics::event(&format!(
+                "pause_hooks_while_drawing={}",
+                s.pause_hooks_while_drawing
+            ));
             start_hit_test_loop(
                 handle.clone(),
                 settings_for_setup,

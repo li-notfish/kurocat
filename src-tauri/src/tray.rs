@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 struct TrayCheckHandles {
     pause_guard: CheckMenuItem<Wry>,
     pause_hooks_while_drawing: CheckMenuItem<Wry>,
+    diagnostics_log: CheckMenuItem<Wry>,
     click_through: CheckMenuItem<Wry>,
     key_bubbles: CheckMenuItem<Wry>,
     privacy_guard: CheckMenuItem<Wry>,
@@ -48,6 +49,28 @@ fn active_handles() -> &'static Mutex<Option<TrayCheckHandles>> {
     HANDLES.get_or_init(|| Mutex::new(None))
 }
 
+/// Opens the folder that holds the diagnostics log.
+///
+/// Reproducing an input problem is only half the job; the log also has to be
+/// found and copied afterwards. This opens the right folder so the file that
+/// gets copied is the one that was just written.
+fn open_diagnostics_folder() {
+    let path = crate::diagnostics::log_path();
+    let folder = path.parent().map(|p| p.to_path_buf()).unwrap_or(path);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(folder).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(folder).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    }
+}
+
 fn default_tray_tooltip(lang: &str) -> String {
     #[cfg(windows)]
     {
@@ -64,6 +87,7 @@ pub fn sync_checkmarks(s: &AppSettings) {
             let _ = h.click_through.set_checked(s.click_through_locked);
             let _ = h.key_bubbles.set_checked(s.show_key_bubbles);
             let _ = h.pause_hooks_while_drawing.set_checked(s.pause_hooks_while_drawing);
+            let _ = h.diagnostics_log.set_checked(s.diagnostics_enabled);
             let _ = h.privacy_guard.set_checked(s.privacy_password_guard);
             let _ = h.sound_toggle.set_checked(s.sound_enabled);
             let _ = h.typing_sound_toggle.set_checked(s.typing_sound_enabled);
@@ -156,6 +180,13 @@ fn build_tray_menu(
         "记录诊断日志（排查输入延迟）",
         true,
         initial.diagnostics_enabled,
+        None::<&str>,
+    )?;
+    let open_diagnostics_log = MenuItem::with_id(
+        app,
+        "open_diagnostics_log",
+        "打开诊断日志文件夹",
+        true,
         None::<&str>,
     )?;
     let privacy_guard = CheckMenuItem::with_id(
@@ -444,6 +475,7 @@ fn build_tray_menu(
             &privacy_guard,
             &pause_hooks_while_drawing,
             &diagnostics_log,
+            &open_diagnostics_log,
             &key_bubbles,
             &sound_toggle,
             &typing_sound_toggle,
@@ -572,6 +604,7 @@ fn build_tray_menu(
     let handles = TrayCheckHandles {
         pause_guard,
         pause_hooks_while_drawing,
+        diagnostics_log,
         click_through,
         key_bubbles,
         privacy_guard,
@@ -798,17 +831,23 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         crate::config::save_settings(&s);
                         s.clone()
                     };
+                    crate::diagnostics::event(&format!("pause_hooks_while_drawing={}", updated.pause_hooks_while_drawing));
                     sync_checkmarks(&updated);
                     let _ = app.emit("kuro-settings", updated);
                 }
+                "open_diagnostics_log" => {
+                    open_diagnostics_folder();
+                }
                 "diagnostics_log" => {
-                    let mut s = state.settings.lock().unwrap();
-                    s.diagnostics_enabled = !s.diagnostics_enabled;
-                    let enabled = s.diagnostics_enabled;
-                    crate::config::save_settings(&s);
-                    crate::diagnostics::set_enabled(enabled);
-                    let _ = diagnostics_log.set_checked(enabled);
-                    let _ = app.emit("kuro-settings", s.clone());
+                    let updated = {
+                        let mut s = state.settings.lock().unwrap();
+                        s.diagnostics_enabled = !s.diagnostics_enabled;
+                        crate::config::save_settings(&s);
+                        s.clone()
+                    };
+                    crate::diagnostics::set_enabled(updated.diagnostics_enabled);
+                    sync_checkmarks(&updated);
+                    let _ = app.emit("kuro-settings", updated);
                 }
                 "privacy_guard" => {
                     let updated = {
