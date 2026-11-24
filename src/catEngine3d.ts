@@ -7,7 +7,7 @@ import {
 } from './catSkins';
 import type { KeyboardLayoutId } from './keyboardLayout';
 import type { CatHitZone, KeyboardOrientation, PeekEdge, TailKeyMode } from './catEngine';
-import { DEFAULT_TAIL_KEY_IDS } from './catEngine';
+import { DEFAULT_TAIL_KEY_IDS, TAIL_PAD_BUTTONS, tailTargetHash } from './catEngine';
 import { catAudio } from './audio';
 import {
   FurShaderSystem,
@@ -47,6 +47,27 @@ const HEAD_CY = 1.56;
 const TABLET_ACTIVITY_WINDOW_MS = 1400;
 const TABLET_KEY_SWITCH_GRACE_MS = 220;
 const GAMEPAD_HANDSHAKE_MS = 1400;
+
+/**
+ * What the cat's tail strikes. The tail only ever aims at a control that is
+ * really on screen: a keyboard key while the keyboard is in front, an
+ * ExpressKey while the tablet is in front, a gamepad button while the pad is
+ * in front.
+ */
+type TailTarget =
+  | { kind: 'key'; keyId: string }
+  | { kind: 'tabletKey'; index: number }
+  | { kind: 'padButton'; button: number };
+
+
+
+function tailTargetEquals(a: TailTarget, b: TailTarget): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'key' && b.kind === 'key') return a.keyId === b.keyId;
+  if (a.kind === 'tabletKey' && b.kind === 'tabletKey') return a.index === b.index;
+  if (a.kind === 'padButton' && b.kind === 'padButton') return a.button === b.button;
+  return false;
+}
 
 interface PawTrack3D {
   side: -1 | 1;
@@ -889,7 +910,10 @@ export class KuroCatEngine3D {
 
   private paws: { L: PawTrack3D; R: PawTrack3D };
   private tailTap = {
-    keyId: null as string | null,
+    /** The control the tail strikes right now. */
+    target: null as TailTarget | null,
+    /** The keyboard key that asked for the strike. */
+    sourceKeyId: null as string | null,
     t0: -100,
     dur: 0.17,
     from: 0,
@@ -2550,7 +2574,7 @@ export class KuroCatEngine3D {
     this.syncDeskFloorShadows();
     this.paws.L.keyId = null;
     this.paws.R.keyId = null;
-    this.tailTap.keyId = null;
+    this.clearTailTarget();
   }
 
   public setChromaKeyBg(hex: string | null): void {
@@ -2599,7 +2623,7 @@ export class KuroCatEngine3D {
     );
     if (this.tailKeyMode === 'off') {
       this.tailTap.down = false;
-      this.tailTap.keyId = null;
+      this.clearTailTarget();
     }
   }
 
@@ -2630,6 +2654,7 @@ export class KuroCatEngine3D {
       this.paws.L.down = false;
       this.paws.R.down = false;
       this.tailTap.down = false;
+      this.clearTailTarget();
       this.isCross = false;
       this.curiousUntil = -100;
     }
@@ -2684,9 +2709,9 @@ export class KuroCatEngine3D {
     this.wakeAt = -100;
     this.isCross = false;
     const targetId = this.desk.getKeyById('enter') ? 'enter' : 'space';
-    this.triggerTailKey(targetId, targetId === 'enter' ? 'Enter' : 'Space');
+    this.triggerTailStrike(targetId, targetId === 'enter' ? 'Enter' : 'Space');
     window.setTimeout(() => {
-      if (this.tailTap.keyId === targetId) this.tailTap.down = false;
+      if (this.tailTap.sourceKeyId === targetId) this.tailTap.down = false;
     }, 180);
   }
 
@@ -2996,33 +3021,24 @@ export class KuroCatEngine3D {
     // keyboard right now, keeps the foreground. The 2D engine follows the same
     // rules, so both renderers always agree on what is in front of the cat.
     if (this.shouldHoldGamepadThroughHandshake(now)) return;
-    if (this.shouldTreatKeyboardAsTabletExpressKey(now)) {
+    // The keyboard is only in front while the cat is in keyboard mode. When a
+    // tablet or a gamepad keeps the foreground the keyboard is hidden, so the
+    // press is echoed on the peripheral instead of an invisible key.
+    const tabletInFront = this.deviceMode === 'tablet';
+    const gamepadInFront = this.deviceMode === 'gamepad' && this.forcedDevice === 'gamepad';
+    if (tabletInFront || gamepadInFront) {
       this.wake();
-      if (!repeat) {
-        const spec = this.desk.resolveKey(vk);
-        if (spec) {
-          this.spawnKeyPopup(
-            spec.spec.id,
-            spec.spec.bubble || spec.spec.label || spec.spec.id,
-            this.paws.L.side,
-          );
-        }
+      if (tabletInFront && this.shouldTreatKeyboardAsTabletExpressKey(now)) {
+        if (!repeat) this.echoKeyOnPeripheral(vk);
+        return;
       }
-      return;
-    }
-    if (this.shouldDeferKeyboardSwitchForTablet()) {
-      this.wake();
-      this.scheduleTabletKeyboardSwitch();
-      if (!repeat) {
-        const spec = this.desk.resolveKey(vk);
-        if (spec) {
-          this.spawnKeyPopup(
-            spec.spec.id,
-            spec.spec.bubble || spec.spec.label || spec.spec.id,
-            this.paws.L.side,
-          );
-        }
+      if (tabletInFront && this.shouldDeferKeyboardSwitchForTablet()) {
+        this.scheduleTabletKeyboardSwitch();
+        if (!repeat) this.echoKeyOnPeripheral(vk);
+        return;
       }
+      // The tray's device demo keeps the peripheral in front for good.
+      if (!repeat) this.echoKeyOnPeripheral(vk);
       return;
     }
     this.setDeviceFromInput('keyboard');
@@ -3038,15 +3054,8 @@ export class KuroCatEngine3D {
       this.pokeAnnoy(0.32);
     }
 
-    const useTail =
-      this.tailKeyMode === 'custom'
-        ? this.tailKeyIdSet.has(k.spec.id)
-        : !this.isCross &&
-          this.tailKeyMode !== 'off' &&
-          (this.desk.isRightEdgeTailKey(k.spec.id) ||
-            (this.tailKeyMode === 'smart' && (k.spec.id === 'space' || k.spec.id === 'enter')));
-    if (useTail) {
-      this.triggerTailKey(k.spec.id, k.spec.bubble || k.spec.label || k.spec.id);
+    if (this.shouldUseTailFor(k.spec.id)) {
+      this.triggerTailStrike(k.spec.id, k.spec.bubble || k.spec.label || k.spec.id);
       return;
     }
 
@@ -3074,8 +3083,9 @@ export class KuroCatEngine3D {
   public onKeyUp(vk: number): void {
     const k = this.desk.resolveKey(vk);
     if (!k) return;
-    if (this.tailTap.keyId === k.spec.id) {
+    if (this.tailTap.sourceKeyId === k.spec.id) {
       this.tailTap.down = false;
+      this.releaseTailTarget();
     }
     this.desk.setKeyDown(k.spec.id, false);
     if (this.paws.L.keyId === k.spec.id) this.paws.L.down = false;
@@ -3685,21 +3695,132 @@ export class KuroCatEngine3D {
     this.lastPoke = this.elapsed;
   }
 
-  private triggerTailKey(keyId: string, bubbleLabel: string): void {
-    this.tailTap.keyId = keyId;
+  private triggerTailStrike(keyId: string, bubbleLabel: string): void {
+    this.tailTap.sourceKeyId = keyId;
     this.tailTap.from = this.tailTap.reach;
     this.tailTap.t0 = this.elapsed;
     this.tailTap.dur = 0.135;
     this.tailTap.down = true;
     this.tailTap.landAt = this.elapsed;
-    this.desk.setKeyDown(keyId, true);
+    this.syncTailTarget();
     this.sSquash.kick(0.24);
     if (this.showKeyBubbles) {
-      this.spawnKeyPopup(keyId, bubbleLabel, 1);
+      this.spawnTailBubble(bubbleLabel);
     }
     window.setTimeout(() => {
-      if (!this.tailTap.down) this.desk.setKeyDown(keyId, false);
+      if (!this.tailTap.down) this.releaseTailTarget();
     }, 170);
+  }
+
+  /** Does the tail take this key over, or do the paws press it? */
+  private shouldUseTailFor(keyId: string): boolean {
+    if (this.tailKeyMode === 'custom') return this.tailKeyIdSet.has(keyId);
+    return (
+      !this.isCross &&
+      this.tailKeyMode !== 'off' &&
+      (this.desk.isRightEdgeTailKey(keyId) ||
+        (this.tailKeyMode === 'smart' && (keyId === 'space' || keyId === 'enter')))
+    );
+  }
+
+  /** The peripheral that currently owns the foreground, if any. */
+  private foregroundPeripheral(): 'tablet' | 'gamepad' | null {
+    if (this.deviceMode === 'tablet') return 'tablet';
+    if (this.deviceMode === 'gamepad') return 'gamepad';
+    return null;
+  }
+
+  /**
+   * The control the tail should strike. A peripheral in front means the
+   * keyboard key is not on screen, so the strike lands on the peripheral's
+   * own control instead of a position that does not exist.
+   */
+  private resolveTailTarget(keyId: string): TailTarget {
+    const peripheral = this.foregroundPeripheral();
+    if (peripheral === 'tablet') {
+      return { kind: 'tabletKey', index: tailTargetHash(keyId) % 4 };
+    }
+    if (peripheral === 'gamepad') {
+      const pool = TAIL_PAD_BUTTONS;
+      return { kind: 'padButton', button: pool[tailTargetHash(keyId) % pool.length] };
+    }
+    return { kind: 'key', keyId };
+  }
+
+  /** World position of whatever the tail is aiming at. */
+  private tailTargetWorld(target: TailTarget, out: THREE.Vector3): THREE.Vector3 {
+    if (target.kind === 'key') return this.desk.keyTopWorld(target.keyId, out);
+    if (target.kind === 'tabletKey') return this.peripherals.tablet.keyWorld(target.index, out);
+    return this.peripherals.gamepad.buttonWorld(target.button, out);
+  }
+
+  /** Pushes the aimed control down, or lets it go again. */
+  private setTailTargetPressed(target: TailTarget, down: boolean): void {
+    if (target.kind === 'key') {
+      this.desk.setKeyDown(target.keyId, down);
+    } else if (target.kind === 'tabletKey') {
+      this.peripherals.tablet.setTailKey(target.index, down);
+    } else {
+      this.peripherals.gamepad.setTailButton(target.button, down);
+    }
+  }
+
+  /**
+   * Re-aims the tail whenever the foreground changes, so the strike always
+   * lands on a control that is really on screen.
+   */
+  private syncTailTarget(): void {
+    const source = this.tailTap.sourceKeyId;
+    const wanted = source === null ? null : this.resolveTailTarget(source);
+    const current = this.tailTap.target;
+    if (wanted && current && tailTargetEquals(wanted, current)) return;
+    if (current) this.setTailTargetPressed(current, false);
+    this.tailTap.target = wanted;
+    if (wanted && this.tailTap.down) this.setTailTargetPressed(wanted, true);
+  }
+
+  /** Lets go of the control the tail holds, but keeps the aim point. */
+  private releaseTailTarget(): void {
+    const target = this.tailTap.target;
+    if (target) this.setTailTargetPressed(target, false);
+  }
+
+  /** Forgets the aim point completely. */
+  private clearTailTarget(): void {
+    this.releaseTailTarget();
+    this.tailTap.target = null;
+    this.tailTap.sourceKeyId = null;
+  }
+
+  /** The bubble rides on top of whatever the tail strikes. */
+  private spawnTailBubble(label: string): void {
+    const target = this.tailTap.target;
+    if (!target) return;
+    if (target.kind === 'key') {
+      this.spawnKeyPopup(target.keyId, label, 1);
+      return;
+    }
+    this.tailTargetWorld(target, this.popupScratch);
+    this.spawnPeripheralPopup(label, this.popupScratch, target.kind === 'tabletKey' ? -1 : 1);
+  }
+
+  /**
+   * A key press while a peripheral keeps the foreground. The keyboard is
+   * hidden then, so the badge and the tail strike move onto the peripheral's
+   * own controls instead of an invisible key.
+   */
+  private echoKeyOnPeripheral(vk: number): void {
+    const k = this.desk.resolveKey(vk);
+    if (!k) return;
+    const label = k.spec.bubble || k.spec.label || k.spec.id;
+    if (this.shouldUseTailFor(k.spec.id)) {
+      // The tail presses the peripheral's control and the badge rides along.
+      this.triggerTailStrike(k.spec.id, label);
+      return;
+    }
+    const target = this.resolveTailTarget(k.spec.id);
+    this.tailTargetWorld(target, this.popupScratch);
+    this.spawnPeripheralPopup(label, this.popupScratch, target.kind === 'tabletKey' ? -1 : 1);
   }
 
   private spawnKeyPopup(keyId: string, label: string, side: -1 | 1): void {
@@ -4169,6 +4290,9 @@ export class KuroCatEngine3D {
     // foreground. The keyboard and the mouse step aside for them.
     this.updatePeripherals(dt);
     this.desk.setDeskVisibility(this.deviceMode === 'keyboard', this.deviceMode === 'keyboard');
+    // The foreground can change while the tail is reaching, so the aim is
+    // refreshed every frame to keep it on a control that is really there.
+    this.syncTailTarget();
 
     // 4) Spine lean, hunch, squash & breathing on continuous one-piece body
     const mousing = this.isMousing();
@@ -4615,9 +4739,10 @@ export class KuroCatEngine3D {
       pt.lerpVectors(attached, loose, smoothstep(0.1, 0.7, w));
     }
 
-    if (this.tailTap.reach > 0.01 && this.tailTap.keyId) {
-      const tipWorld = this.desk.keyTopWorld(this.tailTap.keyId, this.tailTap.tip);
-      tipWorld.y += this.tailTap.hover + 0.045;
+    if (this.tailTap.reach > 0.01 && this.tailTap.target) {
+      const tipWorld = this.tailTargetWorld(this.tailTap.target, this.tailTap.tip).add(
+        new THREE.Vector3(0, this.tailTap.hover + 0.045, 0),
+      );
       const root = this.tailCurve.points[0];
       this.tmpTailPath[0].set(root.x + 0.36, 0.28, root.z + 0.22);
       this.tmpTailPath[1].set(tipWorld.x + 0.36, 0.30, mix(root.z, tipWorld.z, 0.52));

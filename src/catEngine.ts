@@ -54,6 +54,22 @@ const TABLET_KEY_SWITCH_GRACE_MS = 220;
 // held for this long before the pen is released.
 const TABLET_RANGE_GRACE_MS = 400;
 
+/**
+ * Stable hash, so the same key always lands on the same peripheral control.
+ * The 3D engine uses it too, so both renderers agree on the mapping.
+ */
+export function tailTargetHash(id: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/** D-pad directions the tail may strike: they sit on the cat's side of the pad. */
+export const TAIL_PAD_BUTTONS = [16, 13, 14, 15];
+
 interface Vec2 {
   x: number;
   y: number;
@@ -457,6 +473,10 @@ export class KuroCatEngine {
   }
 
   private getTailTargetPoint(spec: KeySpec): Vec2 {
+    // A peripheral in front hides the keyboard, so the tail strikes the
+    // peripheral's own control instead of a position that is not there.
+    const peripheral = this.peripheralTailTarget(spec.id);
+    if (peripheral) return peripheral;
     if (spec.id === 'space') {
       const isCatFacing = this.keyboardOrientation === 'cat';
       const spaceU = isCatFacing
@@ -466,6 +486,38 @@ export class KuroCatEngine {
       return this.clampToKeyboardSurface(this.projectKeyboardPoint(spaceU, rY + 0.50));
     }
     return this.clampToKeyboardSurface(this.getKeyWorldCenter(spec));
+  }
+
+  /**
+   * The peripheral control the tail strikes while a tablet or a gamepad owns
+   * the foreground. Returns null while the keyboard is the one in front.
+   */
+  private peripheralTailTarget(keyId: string): Vec2 | null {
+    if (this.forcedDevice === 'tablet') {
+      const layout = this.getTabletLayout();
+      const index = tailTargetHash(keyId) % 4;
+      this.tabletTailKeys[index] = true;
+      return {
+        x: layout.cx - layout.w * 0.425,
+        y: layout.cy - layout.h * 0.24 + index * layout.h * 0.125,
+      };
+    }
+    if (this.forcedDevice === 'gamepad') {
+      const layout = this.getGamepadLayout();
+      const button = TAIL_PAD_BUTTONS[tailTargetHash(keyId) % TAIL_PAD_BUTTONS.length];
+      const buttonSpec = GAMEPAD_BUTTON_SPECS[button];
+      if (!buttonSpec) return null;
+      return {
+        x: layout.cx + buttonSpec.x * layout.scale,
+        y: layout.cy - buttonSpec.y * layout.scale,
+      };
+    }
+    return null;
+  }
+
+  /** Lets go of the ExpressKeys the tail was holding down. */
+  private clearTabletTailKeys(): void {
+    for (let i = 0; i < 4; i++) this.tabletTailKeys[i] = false;
   }
 
   public previewTailTap(specId: string): void {
@@ -1514,6 +1566,8 @@ export class KuroCatEngine {
   private tabletHardwareConnected = false;
   private tabletFallbackTimer: number | null = null;
   private tabletPhysicalKeys = [false, false, false, false];
+  /** ExpressKeys the cat's tail is holding down. */
+  private tabletTailKeys = [false, false, false, false];
 
   // Tablet input arbitration. A Wacom ExpressKey produces two independent
   // signals - a keyboard shortcut from the OS and a vendor HID report - and
@@ -4228,6 +4282,7 @@ export class KuroCatEngine {
       if (this.privacyMode || this.asleep) {
         this.catTail.active = false;
         this.catTail.heldVks.clear();
+        this.clearTabletTailKeys();
       }
       const tailAge = Math.max(0, now - this.catTail.tapAt);
       const sinceLastPat = now - this.catTail.patAt;
@@ -4239,6 +4294,7 @@ export class KuroCatEngine {
           : Math.max(0, now - Math.max(this.catTail.patAt + 155, this.catTail.releaseAt));
       if (this.catTail.active && !tailPressing && sinceTailRelease > 460) {
         this.catTail.active = false;
+        this.clearTabletTailKeys();
       }
 
       const targetReach = this.catTail.active ? 1 : 0;
@@ -7344,7 +7400,11 @@ export class KuroCatEngine {
     const keyX = -w * 0.425;
     for (let i = 0; i < 4; i++) {
       const keyY = -halfH * 0.48 + i * (h * 0.125);
-      ctx.fillStyle = this.tabletPhysicalKeys[i] ? colors.left : '#3a3f48';
+      ctx.fillStyle = this.tabletPhysicalKeys[i]
+        ? colors.left
+        : this.tabletTailKeys[i]
+          ? '#ff9d4d'
+          : '#3a3f48';
       this.roundRect(ctx, keyX, keyY, Math.max(3.5, w * 0.028), h * 0.09, 1.6);
       ctx.fill();
     }

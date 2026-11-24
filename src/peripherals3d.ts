@@ -25,6 +25,12 @@ const PAD_TRIGGERS = [4, 6];
 const PAD_DPAD = [13, 14, 15, 16];
 const PAD_PLAYER_LEDS = [19, 20, 21, 22];
 
+/** ExpressKey colours: idle, a real press and the cat's tail tapping it. */
+const TABLET_KEY_IDLE = '#59616f';
+const TABLET_KEY_PRESS = new THREE.Color('#d4f044');
+const TABLET_KEY_TAIL = new THREE.Color('#ff9d4d');
+const TABLET_KEY_Y = 0.0525;
+
 interface PadButton3D {
   id: number;
   mesh: THREE.Mesh;
@@ -32,6 +38,8 @@ interface PadButton3D {
   base: THREE.Color;
   glow: number;
   press: number;
+  /** Pressed by the cat's tail instead of by the player. */
+  tail: number;
   x: number;
   z: number;
   radius: number;
@@ -241,6 +249,7 @@ export class Gamepad3D {
       base: new THREE.Color(color),
       glow: 0,
       press: 0,
+      tail: 0,
       x,
       z,
       radius,
@@ -327,6 +336,7 @@ export class Gamepad3D {
         base: new THREE.Color('#666f7e'),
         glow: 0,
         press: 0,
+        tail: 0,
         x,
         z,
         radius: 4 * PAD_SCALE,
@@ -379,6 +389,7 @@ export class Gamepad3D {
         base: new THREE.Color('#353b46'),
         glow: 0,
         press: 0,
+        tail: 0,
         x,
         z,
         radius: 6 * PAD_SCALE,
@@ -404,6 +415,7 @@ export class Gamepad3D {
         base: new THREE.Color('#252a33'),
         glow: 0,
         press: 0,
+        tail: 0,
         x,
         z,
         radius: 6 * PAD_SCALE,
@@ -434,6 +446,7 @@ export class Gamepad3D {
         base: new THREE.Color('#565e6c'),
         glow: 0,
         press: 0,
+        tail: 0,
         x,
         z,
         radius: 5 * PAD_SCALE,
@@ -474,6 +487,13 @@ export class Gamepad3D {
     b.press = clamp(level, 0, 1);
   }
 
+  /** The cat's own tap on a button, kept apart from the real press. */
+  public setTailButton(id: number, down: boolean): void {
+    const b = this.buttons.get(id);
+    if (!b) return;
+    b.tail = down ? 1 : 0;
+  }
+
   public setAxis(axis: number, value: number): void {
     // axis 0/1 = left stick, axis 2/3 = right stick.
     if (axis === 0) this.sticks[0].axisX = value;
@@ -505,7 +525,8 @@ export class Gamepad3D {
     this.group.position.set(this.basePos.x + shakeX, this.basePos.y, this.basePos.z + shakeZ);
 
     for (const b of this.buttons.values()) {
-      const target = b.press;
+      // The tail can push a button too, so both presses share one animation.
+      const target = Math.max(b.press, b.tail);
       b.glow += (target - b.glow) * approach(target > 0.02 ? 40 : 8, dt);
       const isAccent = PAD_FACE_BUTTONS.includes(b.id);
       if (isAccent) {
@@ -621,8 +642,16 @@ export class Tablet3D {
   private readonly penButtonMats: THREE.MeshBasicMaterial[] = [];
 
   private readonly keyMats: THREE.MeshBasicMaterial[] = [];
+  /** The ExpressKey meshes, so the tail can push one of them down. */
+  private readonly keyMeshes: THREE.Mesh[] = [];
   /** Local positions of the four ExpressKeys, so badges can float above them. */
   private readonly keyPositions: THREE.Vector3[] = [];
+  /** Real ExpressKey presses, one bit per key. */
+  private keyMask = 0;
+  /** ExpressKey presses caused by the cat's tail, one bit per key. */
+  private keyTailMask = 0;
+  /** Smoothed glow of every ExpressKey. */
+  private readonly keyGlow = [0, 0, 0, 0];
   private readonly meterMat: THREE.MeshBasicMaterial;
   private readonly meterFill: THREE.Mesh;
   private readonly cable: TaperTube3D;
@@ -679,11 +708,12 @@ export class Tablet3D {
 
     // ExpressKeys on the left bezel.
     for (let i = 0; i < 4; i++) {
-      const mat = new THREE.MeshBasicMaterial({ color: '#59616f' });
+      const mat = new THREE.MeshBasicMaterial({ color: TABLET_KEY_IDLE });
       const key = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.012, 0.10), mat);
-      key.position.set(-0.76, 0.0525, -0.30 + i * 0.19);
+      key.position.set(-0.76, TABLET_KEY_Y, -0.30 + i * 0.19);
       this.group.add(key);
       this.keyMats.push(mat);
+      this.keyMeshes.push(key);
       this.keyPositions.push(key.position.clone());
     }
 
@@ -792,15 +822,36 @@ export class Tablet3D {
   }
 
   public setKeys(mask: number): void {
-    for (let i = 0; i < 4; i++) {
-      const on = (mask & (1 << i)) !== 0;
-      this.keyMats[i].color.set(on ? '#d4f044' : '#59616f');
-    }
+    this.keyMask = mask & 0x0f;
+  }
+
+  /** The cat's tail taps an ExpressKey without faking a real press. */
+  public setTailKey(index: number, down: boolean): void {
+    if (index < 0 || index > 3) return;
+    if (down) this.keyTailMask |= 1 << index;
+    else this.keyTailMask &= ~(1 << index);
   }
 
   public update(dt: number): void {
     this.visible += (this.visibleTarget - this.visible) * approach(12, dt);
     this.group.visible = this.visible > 0.02;
+
+    // ExpressKeys glow green for a real press and orange while the cat's tail
+    // holds them down, and they sink a little while they are lit.
+    for (let i = 0; i < 4; i++) {
+      const real = (this.keyMask & (1 << i)) !== 0;
+      const tail = (this.keyTailMask & (1 << i)) !== 0;
+      const target = real ? 1 : tail ? 0.8 : 0;
+      this.keyGlow[i] += (target - this.keyGlow[i]) * approach(target > 0.02 ? 40 : 8, dt);
+      const glow = this.keyGlow[i];
+      const mat = this.keyMats[i];
+      if (glow <= 0.02) {
+        mat.color.set(TABLET_KEY_IDLE);
+      } else {
+        mat.color.set(TABLET_KEY_IDLE).lerp(real ? TABLET_KEY_PRESS : TABLET_KEY_TAIL, glow);
+      }
+      this.keyMeshes[i].position.y = TABLET_KEY_Y - glow * 0.006;
+    }
 
     const wantActive = this.pen.inRange || this.pen.tip ? 1 : 0;
     this.penActive += (wantActive - this.penActive) * approach(wantActive ? 14 : 3.2, dt);
