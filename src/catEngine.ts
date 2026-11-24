@@ -498,7 +498,7 @@ export class KuroCatEngine {
       const index = tailTargetHash(keyId) % 4;
       this.tabletTailKeys[index] = true;
       return {
-        x: layout.cx - layout.w * 0.425,
+        x: layout.cx + layout.w * 0.425,
         y: layout.cy - layout.h * 0.24 + index * layout.h * 0.125,
       };
     }
@@ -3305,13 +3305,13 @@ export class KuroCatEngine {
     if (!this.showKeyBubbles || this.privacyMode) return;
     const layout = this.getTabletLayout();
     if (this.tabletKeyBadges.length >= 3) this.tabletKeyBadges.shift();
-    const keyX = layout.cx - layout.w * 0.385;
+    const keyX = layout.cx + layout.w * 0.385;
     const keyY = layout.cy - layout.h * 0.35 + (keyIndex ?? 0) * layout.h * 0.125;
     this.tabletKeyBadges.push({
       id: this.nextBubbleId++,
       label,
       accent: this.getMouseButtonColors().left,
-      x: keyIndex === undefined ? layout.cx - layout.w * 0.38 : keyX,
+      x: keyIndex === undefined ? layout.cx + layout.w * 0.38 : keyX,
       y: keyIndex === undefined ? layout.cy - layout.h * 0.52 : keyY,
       createdAt: now,
       lifetime: 860,
@@ -7396,8 +7396,10 @@ export class KuroCatEngine {
     ctx.fill();
     ctx.stroke();
 
-    // Express keys on the left bezel.
-    const keyX = -w * 0.425;
+    // Express keys on the right bezel, the cat's side of the board. The tail
+    // comes from the right hip, so a strike drops onto a key instead of
+    // sweeping across the whole drawing surface.
+    const keyX = w * 0.425;
     for (let i = 0; i < 4; i++) {
       const keyY = -halfH * 0.48 + i * (h * 0.125);
       ctx.fillStyle = this.tabletPhysicalKeys[i]
@@ -7412,7 +7414,7 @@ export class KuroCatEngine {
     ctx.font = '600 4.4px "Segoe UI", system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('KURO', keyX + w * 0.014, halfH - 9);
+    ctx.fillText('KURO', keyX - w * 0.014, halfH - 9);
 
     // Pressure meter on the lower right bezel. The bar is clamped to the
     // outline of the body: the meter is the pressure readout and it must

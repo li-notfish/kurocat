@@ -59,6 +59,13 @@ type TailTarget =
   | { kind: 'tabletKey'; index: number }
   | { kind: 'padButton'; button: number };
 
+/**
+ * Radius of the tail tip when it lands on a control. The tail is a tapered
+ * tube, so a blunt tip the width of the tail would swallow a small D-pad
+ * button; the last stretch narrows down to a point that can tap.
+ */
+const TAIL_TIP_RADIUS = 0.016;
+
 
 
 function tailTargetEquals(a: TailTarget, b: TailTarget): boolean {
@@ -1046,6 +1053,7 @@ export class KuroCatEngine3D {
   private readonly tmpTailAttached = new THREE.Vector3();
   private readonly tmpTailLoose = new THREE.Vector3();
   private readonly tmpTailScratch = new THREE.Vector3();
+  private readonly tmpTailTip = new THREE.Vector3();
   private readonly tmpTailPath = [
     new THREE.Vector3(),
     new THREE.Vector3(),
@@ -3754,6 +3762,17 @@ export class KuroCatEngine3D {
     return this.peripherals.gamepad.buttonWorld(target.button, out);
   }
 
+  /**
+   * Top surface of whatever the tail is aiming at. The tip lands exactly on
+   * this point, so a strike reads as a tap on the control instead of a blunt
+   * tail parked over the device.
+   */
+  private tailTargetTopWorld(target: TailTarget, out: THREE.Vector3): THREE.Vector3 {
+    if (target.kind === 'key') return this.desk.keyTopWorld(target.keyId, out);
+    if (target.kind === 'tabletKey') return this.peripherals.tablet.keyTopWorld(target.index, out);
+    return this.peripherals.gamepad.buttonTopWorld(target.button, out);
+  }
+
   /** Pushes the aimed control down, or lets it go again. */
   private setTailTargetPressed(target: TailTarget, down: boolean): void {
     if (target.kind === 'key') {
@@ -4740,17 +4759,43 @@ export class KuroCatEngine3D {
     }
 
     if (this.tailTap.reach > 0.01 && this.tailTap.target) {
-      const tipWorld = this.tailTargetWorld(this.tailTap.target, this.tailTap.tip).add(
-        new THREE.Vector3(0, this.tailTap.hover + 0.045, 0),
-      );
       const root = this.tailCurve.points[0];
-      this.tmpTailPath[0].set(root.x + 0.36, 0.28, root.z + 0.22);
-      this.tmpTailPath[1].set(tipWorld.x + 0.36, 0.30, mix(root.z, tipWorld.z, 0.52));
-      this.tmpTailPath[2].set(tipWorld.x + 0.26, 0.32, tipWorld.z - 0.06);
-      this.tmpTailPath[3].set(tipWorld.x + 0.12, mix(0.32, tipWorld.y + 0.02, 0.5), tipWorld.z + 0.02);
-      for (let i = 1; i < this.tailCurve.points.length; i++) {
-        const dst = i - 1 < 4 ? this.tmpTailPath[i - 1] : tipWorld;
-        this.tailCurve.points[i].lerp(dst, this.tailTap.reach);
+      if (this.tailTap.target.kind === 'key') {
+        // A keyboard key sits on a board in front of the cat, so the tail
+        // sweeps sideways over the keys the way it always did.
+        const tipWorld = this.tailTargetWorld(this.tailTap.target, this.tailTap.tip).add(
+          new THREE.Vector3(0, this.tailTap.hover + 0.045, 0),
+        );
+        this.tmpTailPath[0].set(root.x + 0.36, 0.28, root.z + 0.22);
+        this.tmpTailPath[1].set(tipWorld.x + 0.36, 0.30, mix(root.z, tipWorld.z, 0.52));
+        this.tmpTailPath[2].set(tipWorld.x + 0.26, 0.32, tipWorld.z - 0.06);
+        this.tmpTailPath[3].set(tipWorld.x + 0.12, mix(0.32, tipWorld.y + 0.02, 0.5), tipWorld.z + 0.02);
+        for (let i = 1; i < this.tailCurve.points.length; i++) {
+          const dst = i - 1 < 4 ? this.tmpTailPath[i - 1] : tipWorld;
+          this.tailCurve.points[i].lerp(dst, this.tailTap.reach);
+        }
+      } else {
+        // A peripheral control sits on a slab the tail must not cut through.
+        // The tail lifts, arcs over the device and drops straight down onto
+        // the top of the control, so the tip never sinks into the body.
+        const topWorld = this.tailTargetTopWorld(this.tailTap.target, this.tailTap.tip);
+        const tipWorld = this.tmpTailTip.copy(topWorld);
+        tipWorld.y += this.tailTap.hover + TAIL_TIP_RADIUS;
+        this.tmpTailPath[0].set(root.x + 0.08, root.y + 0.30, root.z + 0.12);
+        this.tmpTailPath[1].set(
+          mix(root.x, tipWorld.x, 0.42),
+          Math.max(root.y, tipWorld.y) + 0.46,
+          mix(root.z, tipWorld.z, 0.46),
+        );
+        // The last two points stay above the control: the tip rests on the
+        // surface, so the stretch above it must not dive into the device.
+        const rest = tipWorld.y + this.tailTap.hover * 0.5 + 0.02;
+        this.tmpTailPath[2].set(tipWorld.x, Math.max(tipWorld.y + 0.10, rest + 0.10), tipWorld.z);
+        this.tmpTailPath[3].set(tipWorld.x, Math.max(tipWorld.y + 0.05, rest), tipWorld.z);
+        for (let i = 1; i < this.tailCurve.points.length; i++) {
+          const dst = i - 1 < 4 ? this.tmpTailPath[i - 1] : tipWorld;
+          this.tailCurve.points[i].lerp(dst, this.tailTap.reach);
+        }
       }
     }
 
@@ -4764,9 +4809,17 @@ export class KuroCatEngine3D {
     this.tailLimb.fill.mesh.visible = showTail;
     for (const c of this.tailLimb.caps) c.visible = showTail;
     if (showTail) {
+      // While the tail strikes a peripheral control the last stretch narrows
+      // to a point so a small D-pad button is tapped instead of swallowed.
+      const tailTapTip =
+        this.tailTap.target && this.tailTap.target.kind !== 'key' ? TAIL_TIP_RADIUS : 0;
       this.tailLimb.update(
         (u, out) => this.tailCurve.getPoint(u, out),
-        (u) => mix(0.068, 0.044, u) * fluffyMul * (1 - 0.12 * Math.sin(u * Math.PI)),
+        (u) => {
+          const base = mix(0.068, 0.044, u) * fluffyMul * (1 - 0.12 * Math.sin(u * Math.PI));
+          if (tailTapTip <= 0) return base;
+          return mix(base, tailTapTip, smoothstep(0.78, 1, u));
+        },
       );
     }
 

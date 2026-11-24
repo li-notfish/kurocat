@@ -30,6 +30,10 @@ const TABLET_KEY_IDLE = '#59616f';
 const TABLET_KEY_PRESS = new THREE.Color('#d4f044');
 const TABLET_KEY_TAIL = new THREE.Color('#ff9d4d');
 const TABLET_KEY_Y = 0.0525;
+/** Half the height of an ExpressKey, so the tail tip can land on its top. */
+const TABLET_KEY_HALF_H = 0.006;
+/** The ExpressKey column sits on the right bezel, the cat's side of the board. */
+const TABLET_KEY_X = 0.72;
 
 interface PadButton3D {
   id: number;
@@ -49,6 +53,8 @@ interface PadButton3D {
   dir: THREE.Vector3;
   /** Resting position, so the press offset never accumulates. */
   rest: THREE.Vector3;
+  /** Height of the top surface of the part, in local space. */
+  topY: number;
 }
 
 const labelTextureCache = new Map<string, THREE.CanvasTexture>();
@@ -256,6 +262,7 @@ export class Gamepad3D {
       travel: opts?.travel ?? 0.012,
       dir: new THREE.Vector3(...(opts?.dir ?? [0, -1, 0])),
       rest,
+      topY: rest.y + height / 2,
     };
     this.buttons.set(id, entry);
 
@@ -343,6 +350,7 @@ export class Gamepad3D {
         travel: 0.008,
         dir: new THREE.Vector3(0, -1, 0),
         rest: new THREE.Vector3(x, 0.0605, z),
+        topY: 0.0605 + 0.017 / 2,
       });
     }
   }
@@ -396,6 +404,7 @@ export class Gamepad3D {
         travel: 0.014,
         dir: new THREE.Vector3(0, -1, 0),
         rest: new THREE.Vector3(x, 0.062, z),
+        topY: 0.062 + 0.026 / 2,
       });
     }
 
@@ -422,6 +431,7 @@ export class Gamepad3D {
         travel: 0.02,
         dir: new THREE.Vector3(0, 0, -1),
         rest: new THREE.Vector3(x, 0.05, z),
+        topY: 0.05 + 0.03 / 2,
       });
     }
   }
@@ -453,6 +463,7 @@ export class Gamepad3D {
         travel: 0.01,
         dir: new THREE.Vector3(0, -1, 0),
         rest: new THREE.Vector3(x, 0.0525 + 0.007, z),
+        topY: 0.0525 + 0.007 + 0.014 / 2,
       });
     }
   }
@@ -556,6 +567,18 @@ export class Gamepad3D {
     this.group.updateMatrixWorld(true);
     if (!b) return out.set(0, 0.05, 0).applyMatrix4(this.group.matrixWorld);
     return out.set(b.x, 0.0525 + 0.02, b.z).applyMatrix4(this.group.matrixWorld);
+  }
+
+  /**
+   * Top surface of a button in world space. The tail tip lands exactly on
+   * it, so a strike reads as a tap on the control instead of a blunt tail
+   * hovering over the device.
+   */
+  public buttonTopWorld(id: number, out = new THREE.Vector3()): THREE.Vector3 {
+    const b = this.buttons.get(id);
+    this.group.updateMatrixWorld(true);
+    if (!b) return out.set(0, 0.05, 0).applyMatrix4(this.group.matrixWorld);
+    return out.set(b.x, b.topY, b.z).applyMatrix4(this.group.matrixWorld);
   }
 
   /** World position of an analog stick knob. */
@@ -706,11 +729,14 @@ export class Tablet3D {
     surface.position.set(this.surfaceCx, 0.0505, this.surfaceCz);
     this.group.add(surface);
 
-    // ExpressKeys on the left bezel.
+    // ExpressKeys on the right bezel. The cat sits in front of the tablet and
+    // its tail comes from the right hand side, so the keys live on that side:
+    // a tail strike then drops straight onto a key instead of sweeping across
+    // the whole drawing surface.
     for (let i = 0; i < 4; i++) {
       const mat = new THREE.MeshBasicMaterial({ color: TABLET_KEY_IDLE });
       const key = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.012, 0.10), mat);
-      key.position.set(-0.76, TABLET_KEY_Y, -0.30 + i * 0.19);
+      key.position.set(TABLET_KEY_X, TABLET_KEY_Y, -0.30 + i * 0.19);
       this.group.add(key);
       this.keyMats.push(mat);
       this.keyMeshes.push(key);
@@ -718,18 +744,19 @@ export class Tablet3D {
     }
 
     // Pressure meter on the lower right bezel.
+    // The meter sits below the ExpressKeys, further out on the bezel.
     const meterWell = new THREE.Mesh(
       new THREE.BoxGeometry(0.30, 0.008, 0.035),
       new THREE.MeshBasicMaterial({ color: '#22262e' }),
     );
-    meterWell.position.set(0.52, 0.0515, 0.42);
+    meterWell.position.set(0.52, 0.0515, 0.44);
     this.group.add(meterWell);
     this.meterMat = new THREE.MeshBasicMaterial({ color: '#d4f044' });
     // The fill has to be exactly as wide as the well: the growth code anchors
     // its left edge and scales it, so a wider bar would shoot past the bezel
     // and out of the tablet body.
     this.meterFill = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.01, 0.026), this.meterMat);
-    this.meterFill.position.set(0.52, 0.0525, 0.42);
+    this.meterFill.position.set(0.52, 0.0525, 0.44);
     this.meterFill.scale.set(0.001, 1, 1);
     this.group.add(this.meterFill);
 
@@ -896,6 +923,16 @@ export class Tablet3D {
     const local = this.keyPositions[index];
     if (!local) return out.set(0, 0.05, 0).applyMatrix4(this.group.matrixWorld);
     return out.copy(local).applyMatrix4(this.group.matrixWorld);
+  }
+
+  /** Top surface of an ExpressKey, so the tail tip can land on it. */
+  public keyTopWorld(index: number, out = new THREE.Vector3()): THREE.Vector3 {
+    this.group.updateMatrixWorld(true);
+    const local = this.keyPositions[index];
+    if (!local) return out.set(0, 0.05, 0).applyMatrix4(this.group.matrixWorld);
+    return out
+      .set(local.x, local.y + TABLET_KEY_HALF_H, local.z)
+      .applyMatrix4(this.group.matrixWorld);
   }
 
   /** True while the stylus is hovering over or touching the surface. */
