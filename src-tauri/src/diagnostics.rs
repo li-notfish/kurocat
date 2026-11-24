@@ -38,6 +38,14 @@ pub static PEN_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 /// Nib transitions.
 pub static PEN_TIP_DOWN: AtomicU64 = AtomicU64::new(0);
 pub static PEN_TIP_UP: AtomicU64 = AtomicU64::new(0);
+/// Raw pointer packets that a tablet sent in pointer mode.
+pub static PEN_POINTER_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Pen samples that were rebuilt from a pointer mode tablet.
+pub static PEN_POINTER_EMITS: AtomicU64 = AtomicU64::new(0);
+/// Pointer samples dropped because the pointer did not move.
+pub static PEN_POINTER_UNCHANGED: AtomicU64 = AtomicU64::new(0);
+/// Pointer samples dropped because the previous one was still too recent.
+pub static PEN_POINTER_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 /// Mouse moves seen by the low level hook.
 pub static MOUSE_MOVES_SEEN: AtomicU64 = AtomicU64::new(0);
 /// Mouse moves forwarded to the frontend.
@@ -258,6 +266,10 @@ struct Snapshot {
     pen_rate_limited: u64,
     pen_tip_down: u64,
     pen_tip_up: u64,
+    pen_pointer_packets: u64,
+    pen_pointer_emits: u64,
+    pen_pointer_unchanged: u64,
+    pen_pointer_rate_limited: u64,
     mouse_seen: u64,
     mouse_forwarded: u64,
     mouse_suppressed: u64,
@@ -275,6 +287,10 @@ fn snapshot() -> Snapshot {
         pen_rate_limited: PEN_RATE_LIMITED.load(Ordering::Relaxed),
         pen_tip_down: PEN_TIP_DOWN.load(Ordering::Relaxed),
         pen_tip_up: PEN_TIP_UP.load(Ordering::Relaxed),
+        pen_pointer_packets: PEN_POINTER_PACKETS.load(Ordering::Relaxed),
+        pen_pointer_emits: PEN_POINTER_EMITS.load(Ordering::Relaxed),
+        pen_pointer_unchanged: PEN_POINTER_UNCHANGED.load(Ordering::Relaxed),
+        pen_pointer_rate_limited: PEN_POINTER_RATE_LIMITED.load(Ordering::Relaxed),
         mouse_seen: MOUSE_MOVES_SEEN.load(Ordering::Relaxed),
         mouse_forwarded: MOUSE_MOVES_FORWARDED.load(Ordering::Relaxed),
         mouse_suppressed: MOUSE_MOVES_SUPPRESSED.load(Ordering::Relaxed),
@@ -296,6 +312,16 @@ impl Snapshot {
                 .saturating_sub(previous.pen_rate_limited),
             pen_tip_down: self.pen_tip_down.saturating_sub(previous.pen_tip_down),
             pen_tip_up: self.pen_tip_up.saturating_sub(previous.pen_tip_up),
+            pen_pointer_packets: self
+                .pen_pointer_packets
+                .saturating_sub(previous.pen_pointer_packets),
+            pen_pointer_emits: self.pen_pointer_emits.saturating_sub(previous.pen_pointer_emits),
+            pen_pointer_unchanged: self
+                .pen_pointer_unchanged
+                .saturating_sub(previous.pen_pointer_unchanged),
+            pen_pointer_rate_limited: self
+                .pen_pointer_rate_limited
+                .saturating_sub(previous.pen_pointer_rate_limited),
             mouse_seen: self.mouse_seen.saturating_sub(previous.mouse_seen),
             mouse_forwarded: self.mouse_forwarded.saturating_sub(previous.mouse_forwarded),
             mouse_suppressed: self.mouse_suppressed.saturating_sub(previous.mouse_suppressed),
@@ -317,7 +343,7 @@ fn summary_line(elapsed_ms: u64, delta: Snapshot) -> String {
     let pen_gap = FRONTEND_PEN_GAP_MAX_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     let pen_lat = FRONTEND_PEN_LAT_MAX_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     format!(
-        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_unch={} pen_rlmt={} pen_tip={}/{} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fe_pen_lat_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
+        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_unch={} pen_rlmt={} pen_tip={}/{} pen_ptr={}/s pen_ptr_emit={}/s pen_ptr_unch={} pen_ptr_rlmt={} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fe_pen_lat_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
         timestamp(),
         elapsed_ms,
         rate(delta.pen_reports),
@@ -327,6 +353,10 @@ fn summary_line(elapsed_ms: u64, delta: Snapshot) -> String {
         delta.pen_rate_limited,
         delta.pen_tip_down,
         delta.pen_tip_up,
+        rate(delta.pen_pointer_packets),
+        rate(delta.pen_pointer_emits),
+        delta.pen_pointer_unchanged,
+        delta.pen_pointer_rate_limited,
         rate(delta.mouse_seen),
         rate(delta.mouse_forwarded),
         rate(delta.mouse_suppressed),
@@ -388,6 +418,10 @@ mod tests {
             pen_rate_limited: 0,
             pen_tip_down: 0,
             pen_tip_up: 0,
+            pen_pointer_packets: 0,
+            pen_pointer_emits: 0,
+            pen_pointer_unchanged: 0,
+            pen_pointer_rate_limited: 0,
             mouse_seen: 0,
             mouse_forwarded: 0,
             mouse_suppressed: 0,
@@ -416,6 +450,23 @@ mod tests {
         let line = summary_line(2000, delta);
         assert!(line.contains("pen_report=30/s"), "{line}");
         assert!(line.contains("pen_emit=20/s"), "{line}");
+    }
+
+    #[test]
+    fn delta_counts_the_pointer_mode_packets() {
+        let mut current = snapshot_with(0, 0);
+        current.pen_pointer_packets = 12;
+        current.pen_pointer_emits = 7;
+        let delta = current.delta(snapshot_with(0, 0));
+        assert_eq!(delta.pen_pointer_packets, 12);
+        assert_eq!(delta.pen_pointer_emits, 7);
+    }
+
+    #[test]
+    fn summary_line_reports_the_pointer_mode_counters() {
+        let delta = snapshot_with(0, 0).delta(snapshot_with(0, 0));
+        let line = summary_line(2000, delta);
+        assert!(line.contains("pen_ptr="), "{line}");
     }
 
     #[test]

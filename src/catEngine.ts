@@ -7414,15 +7414,19 @@ export class KuroCatEngine {
     ctx.textBaseline = 'middle';
     ctx.fillText('KURO', keyX + w * 0.014, halfH - 9);
 
-    // Pressure meter on the lower right bezel.
+    // Pressure meter on the lower right bezel. The bar is clamped to the
+    // outline of the body: the meter is the pressure readout and it must
+    // never reach past the edge of the tablet, whatever the layout is.
     const meterX = sx + sw * 0.24;
     const meterY = halfH - 8;
+    const bodyHalfAtMeter = topHalfW + (botHalfW - topHalfW) * ((meterY + halfH) / h);
+    const meterW = Math.max(6, Math.min(sw * 0.24, bodyHalfAtMeter - 5 - meterX));
     ctx.fillStyle = '#16191d';
-    this.roundRect(ctx, meterX, meterY, sw * 0.24, 4, 2);
+    this.roundRect(ctx, meterX, meterY, meterW, 4, 2);
     ctx.fill();
     if (pressure > 0.02) {
       ctx.fillStyle = colors.left;
-      this.roundRect(ctx, meterX, meterY, sw * 0.24 * Math.min(1, pressure), 4, 2);
+      this.roundRect(ctx, meterX, meterY, meterW * Math.min(1, pressure), 4, 2);
       ctx.fill();
     }
 

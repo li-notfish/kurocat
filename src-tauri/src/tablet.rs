@@ -14,22 +14,25 @@ use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidP_MaxDataListLength, HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_DATA, HIDP_STATUS_SUCCESS,
     HIDP_VALUE_CAPS,
 };
-use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
-    RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RIDEV_DEVNOTIFY,
-    RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RID_INPUT, RIM_TYPEHID,
-    RID_DEVICE_INFO,
+    MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RAWMOUSE,
+    RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
+    RID_INPUT, RID_DEVICE_INFO, RIM_TYPEMOUSE, RIM_TYPEHID,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW,
-    RegisterClassW, TranslateMessage, GIDC_ARRIVAL, GIDC_REMOVAL, HWND_MESSAGE,
-    MWMO_INPUTAVAILABLE, MSG, PM_REMOVE, QS_ALLINPUT, WNDCLASSW, WM_INPUT,
-    WM_INPUT_DEVICE_CHANGE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetSystemMetrics,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassW, TranslateMessage, GIDC_ARRIVAL,
+    GIDC_REMOVAL, HWND_MESSAGE, MWMO_INPUTAVAILABLE, MSG, PM_REMOVE, QS_ALLINPUT,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WNDCLASSW,
+    WM_INPUT, WM_INPUT_DEVICE_CHANGE,
 };
 
 const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// The generic desktop usage of a mouse.
+const USAGE_MOUSE: u16 = 0x02;
 const USAGE_PAGE_BUTTON: u16 = 0x09;
 const USAGE_PAGE_DIGITIZER: u16 = 0x0d;
 const USAGE_PAGE_WACOM_TABLET: u16 = 0xff00;
@@ -81,6 +84,18 @@ const PEN_DRAWING_PAUSE_WINDOW: Duration = Duration::from_millis(400);
 // stutter. A short linger turns a sequence of strokes into a single install
 // and a single removal instead of one pair per stroke.
 const PEN_DRAWING_PAUSE_LINGER: Duration = Duration::from_millis(3000);
+// A tablet that is not switched to Windows Ink reports the pen as a plain
+// mouse: the driver moves the OS pointer and the nib is only the left
+// button. The nib can be rebuilt from that, which keeps the cat's pen on the
+// real stroke without the ink mode the user did not want.
+const POINTER_EMIT_INTERVAL: Duration = Duration::from_millis(12);
+// A pointer mode nib has no pressure sensor. A fixed mid pressure keeps the
+// stroke at a readable width instead of a hairline.
+const POINTER_PRESSURE: f32 = 0.45;
+// A pointer only moves when it moves, so the dead zone is tiny.
+const POINTER_MOVE_EPSILON: f32 = 1.0 / 2048.0;
+// The raw mouse button bits. windows-sys does not export them.
+const RI_MOUSE_LEFT_BUTTON_DOWN: u32 = 0x0001;
 
 /// Latched "is the pen on the tablet" state.
 #[derive(Debug, Default)]
@@ -180,6 +195,10 @@ struct HidDevice {
     pending_rate_limited: bool,
     /// Whether the nib touched the surface in the last forwarded sample.
     pen_tip_down: bool,
+    /// How many pen samples were forwarded. A tablet that delivers samples
+    /// runs in Windows Ink mode, and then the pointer fallback stays out of
+    /// the way.
+    pen_samples: u64,
     last_emit: Instant,
     max_data_len: usize,
     entries: Vec<HIDP_DATA>,
@@ -204,6 +223,43 @@ struct TabletContext {
     drawing_pause_until: Option<Instant>,
     /// Whether the nib was down during the previous update.
     pen_tip_down: bool,
+    /// The vendor ids of the tablets that are connected right now. A mouse
+    /// class device with one of these vendors belongs to a tablet.
+    tablet_vendors: HashSet<u16>,
+    /// The pointer class devices that were seen, keyed by the raw handle.
+    pointer_devices: HashMap<usize, PointerDevice>,
+    /// The vendor of every pointer class device that was seen. The lookup
+    /// happens once per device, because the hot path is every mouse move on
+    /// the whole system.
+    pointer_vendors: HashMap<usize, u16>,
+    /// Whether a tablet already delivered real pen samples.
+    native_pen: bool,
+    /// The device info of the raw devices that were looked up already.
+    device_meta: HashMap<usize, DeviceMeta>,
+}
+
+/// A mouse class device that may belong to a tablet.
+///
+/// A tablet that stays in its own driver mode reports the pen as a plain
+/// mouse. Such a device carries neither pressure nor tilt, but it does carry
+/// the position and the nib, and that is enough to keep the cat's pen on the
+/// real stroke.
+struct PointerDevice {
+    vendor_id: u16,
+    path: String,
+    /// Whether the nib is on the surface.
+    tip_down: bool,
+    /// Latched "the pen is over the tablet" state.
+    range: PenRange,
+    /// Whether the device was already written to the log.
+    logged: bool,
+    /// The position that was forwarded last.
+    last_nx: f32,
+    last_ny: f32,
+    /// The nib state that was forwarded last.
+    last_tip: bool,
+    /// When the last sample went out.
+    last_emit: Option<Instant>,
 }
 
 unsafe extern "system" fn tablet_wnd_proc(
@@ -266,6 +322,11 @@ fn run(app: AppHandle) {
         drawing_pause_active: false,
         drawing_pause_until: None,
         pen_tip_down: false,
+        tablet_vendors: HashSet::new(),
+        pointer_devices: HashMap::new(),
+        pointer_vendors: HashMap::new(),
+        native_pen: false,
+        device_meta: HashMap::new(),
     };
     scan_initial_devices(&mut context);
 
@@ -315,6 +376,9 @@ fn register_tablet_raw_input(hwnd: HWND) -> bool {
         (USAGE_PAGE_DIGITIZER, 0x03),
         (USAGE_PAGE_WACOM_TABLET, 0x0a),
         (USAGE_PAGE_WACOM_VENDOR, 0x01),
+        // A tablet that is not switched to Windows Ink reports the pen as a
+        // mouse. The mouse class has to be registered to see it.
+        (USAGE_PAGE_GENERIC_DESKTOP, USAGE_MOUSE),
     ];
 
     let register = |extra_flags: u32| {
@@ -349,6 +413,7 @@ fn scan_initial_devices(context: &mut TabletContext) {
             continue;
         }
         context.paths.insert(hdevice as usize, meta.path.clone());
+        refresh_tablet_vendors(context);
         emit_connected(context, &meta);
     }
 }
@@ -364,10 +429,12 @@ fn handle_device_change(context: &mut TabletContext, event: u32, hdevice: HANDLE
                 return;
             }
             context.paths.insert(key, meta.path.clone());
+            refresh_tablet_vendors(context);
             emit_connected(context, &meta);
         }
     } else if event == GIDC_REMOVAL {
         if let Some(path) = context.paths.remove(&key) {
+            refresh_tablet_vendors(context);
             context.devices.remove(&key);
             let still_present = context.paths.values().any(|known| known == &path);
             if !still_present && context.connected.remove(&path) {
@@ -411,14 +478,38 @@ fn handle_raw_input(context: &mut TabletContext, lparam: isize) {
     let Some((buffer, bytes_written)) = read_raw_input(lparam) else {
         return;
     };
-    let Some(packet) = raw_hid_packet(&buffer, bytes_written) else {
+    // A tablet that is not switched to Windows Ink reports the pen as a
+    // mouse. Everything else is the digitizer path with the real pen.
+    match raw_input_kind(&buffer) {
+        Some(RIM_TYPEMOUSE) => handle_raw_mouse(context, &buffer, bytes_written),
+        _ => handle_raw_hid(context, &buffer, bytes_written),
+    }
+}
+
+/// The kind of device that produced a raw input packet.
+fn raw_input_kind(buffer: &[usize]) -> Option<u32> {
+    if buffer.len() < size_of::<RAWINPUTHEADER>() {
+        return None;
+    }
+    let raw_input = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
+    Some(raw_input.header.dwType)
+}
+
+fn handle_raw_hid(context: &mut TabletContext, buffer: &[usize], bytes_written: usize) {
+    let Some(packet) = raw_hid_packet(buffer, bytes_written) else {
         return;
     };
     let key = packet.device as usize;
+    let Some(meta) = device_meta_of(context, packet.device) else {
+        return;
+    };
+    // Some drivers expose the mouse of the tablet as a mouse like HID
+    // collection. The pointer path takes care of it.
+    if meta.usage_page == USAGE_PAGE_GENERIC_DESKTOP && meta.usage == USAGE_MOUSE {
+        handle_pointer_hid(context, &packet);
+        return;
+    }
     if !context.devices.contains_key(&key) {
-        let Some(meta) = query_device_meta(packet.device) else {
-            return;
-        };
         if !is_tablet(&meta) {
             return;
         }
@@ -426,11 +517,13 @@ fn handle_raw_input(context: &mut TabletContext, lparam: isize) {
             return;
         };
         context.paths.insert(key, meta.path.clone());
+        refresh_tablet_vendors(context);
         emit_connected(context, &meta);
         context.devices.insert(key, device);
     }
 
     let app = context.app.clone();
+    let mut native_pen = false;
     if let Some(device) = context.devices.get_mut(&key) {
         // Reuse the HIDP_DATA scratch buffer across packets. Wacom's vendor
         // reports never need it, and allocating it on every WM_INPUT packet
@@ -444,7 +537,213 @@ fn handle_raw_input(context: &mut TabletContext, lparam: isize) {
         }
         device.entries = entries;
         flush_pen(device, &app);
+        native_pen = device.pen_samples > 0;
     }
+    if native_pen {
+        // The tablet delivers real pen samples, so it runs in Windows Ink mode
+        // and the pointer fallback has to stay out of the way.
+        context.native_pen = true;
+    }
+}
+
+/// Handles a mouse class raw input packet.
+///
+/// A tablet that is not switched to Windows Ink reports the pen as a plain
+/// mouse: the driver moves the OS pointer and the nib is the left button.
+/// The nib can be rebuilt from that, which keeps the cat's pen on the real
+/// stroke without the ink mode the user did not want.
+fn handle_raw_mouse(context: &mut TabletContext, buffer: &[usize], bytes_written: usize) {
+    let Some((device, mouse)) = raw_mouse_packet(buffer, bytes_written) else {
+        return;
+    };
+    crate::diagnostics::PEN_POINTER_PACKETS.fetch_add(1, Ordering::Relaxed);
+    let buttons = unsafe { mouse.Anonymous.ulButtons };
+    let tip_down = buttons & RI_MOUSE_LEFT_BUTTON_DOWN != 0;
+    let absolute = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
+        Some((
+            (mouse.lLastX as f32 / 65535.0).clamp(0.0, 1.0),
+            (mouse.lLastY as f32 / 65535.0).clamp(0.0, 1.0),
+        ))
+    } else {
+        None
+    };
+    push_pointer_sample(context, device, tip_down, absolute);
+}
+
+/// A mouse like HID collection of a tablet.
+///
+/// Some drivers do not expose the mouse of the tablet as a mouse device but
+/// as a HID collection. The boot report starts with the button bitmap, and
+/// that is the only part the nib needs.
+fn handle_pointer_hid(context: &mut TabletContext, packet: &RawHidPacket<'_>) {
+    let Some(buttons) = packet.reports.first() else {
+        return;
+    };
+    crate::diagnostics::PEN_POINTER_PACKETS.fetch_add(1, Ordering::Relaxed);
+    push_pointer_sample(context, packet.device, buttons & 0x01 != 0, None);
+}
+
+/// Rebuilds the nib of a tablet that reports the pen as a pointer.
+fn push_pointer_sample(
+    context: &mut TabletContext,
+    device: HANDLE,
+    tip_down: bool,
+    absolute: Option<(f32, f32)>,
+) {
+    let key = device as usize;
+    // The vendor is what links a pointer to a tablet and it never changes for
+    // a device. It is looked up once, because the hot path is every mouse
+    // move of the whole system.
+    let vendor_id = match context.pointer_vendors.get(&key) {
+        Some(vendor) => *vendor,
+        None => {
+            let path = query_device_name(device);
+            let vendor = parse_vid_pid(&path).0;
+            context.pointer_vendors.insert(key, vendor);
+            vendor
+        }
+    };
+    // Only a pointer that belongs to a connected tablet may stand in for the
+    // pen. Every other mouse keeps driving the mouse.
+    if !context.tablet_vendors.contains(&vendor_id) {
+        return;
+    }
+    // A tablet that reports real pen samples knows the pressure, the tilt and
+    // the eraser. The native path always wins.
+    if context.native_pen {
+        return;
+    }
+
+    let now = Instant::now();
+    let (nx, ny) = absolute.unwrap_or_else(pointer_position);
+    let entry = context.pointer_devices.entry(key).or_insert_with(|| PointerDevice {
+        vendor_id,
+        path: query_device_name(device),
+        tip_down: false,
+        range: PenRange::default(),
+        logged: false,
+        last_nx: nx,
+        last_ny: ny,
+        last_tip: false,
+        last_emit: None,
+    });
+    if !entry.logged {
+        entry.logged = true;
+        crate::diagnostics::event(&format!(
+            "pen_pointer_device path={:?} vendor=0x{:04x}",
+            entry.path, entry.vendor_id
+        ));
+    }
+
+    let moved = (nx - entry.last_nx).abs() > POINTER_MOVE_EPSILON
+        || (ny - entry.last_ny).abs() > POINTER_MOVE_EPSILON;
+    let controls_changed = entry.last_tip != tip_down;
+    let in_range = entry.range.observe(tip_down || moved, now);
+    entry.tip_down = tip_down;
+
+    // The pointer owns the mouse while the pen is over the tablet. The raw
+    // mouse moves would only be a second copy of the very same stroke.
+    if in_range {
+        crate::input_hook::suppress_mouse_moves_for(PEN_MOUSE_SUPPRESS_WINDOW);
+    }
+
+    if !moved && !controls_changed {
+        crate::diagnostics::PEN_POINTER_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if let Some(last) = entry.last_emit {
+        if now.duration_since(last) < POINTER_EMIT_INTERVAL {
+            crate::diagnostics::PEN_POINTER_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    entry.last_emit = Some(now);
+    entry.last_nx = nx;
+    entry.last_ny = ny;
+    entry.last_tip = tip_down;
+    crate::diagnostics::PEN_POINTER_EMITS.fetch_add(1, Ordering::Relaxed);
+    crate::diagnostics::IPC_EMITS.fetch_add(1, Ordering::Relaxed);
+    let _ = context.app.emit(
+        "kuro-input",
+        InputEvent::TabletPen {
+            nx,
+            ny,
+            pressure: if tip_down { POINTER_PRESSURE } else { 0.0 },
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            tip: tip_down,
+            barrel: false,
+            second_barrel: false,
+            eraser: false,
+            in_range,
+            at_ms: crate::diagnostics::epoch_millis(),
+        },
+    );
+}
+
+/// The pointer position in the normalized tablet coordinates.
+///
+/// A tablet in pointer mode drives the OS pointer, so the pointer is where
+/// the nib is. The virtual desktop is used so that a second monitor does not
+/// shift the stroke.
+fn pointer_position() -> (f32, f32) {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return (0.5, 0.5);
+    }
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+    (
+        ((point.x - left) as f32 / width as f32).clamp(0.0, 1.0),
+        ((point.y - top) as f32 / height as f32).clamp(0.0, 1.0),
+    )
+}
+
+/// The mouse class data of a raw input packet.
+fn raw_mouse_packet(buffer: &[usize], bytes_written: usize) -> Option<(HANDLE, RAWMOUSE)> {
+    if bytes_written < size_of::<RAWINPUTHEADER>() {
+        return None;
+    }
+    let raw_input = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
+    if raw_input.header.dwType != RIM_TYPEMOUSE {
+        return None;
+    }
+    // The mouse data sits inline in the raw input buffer, so a copy is fine.
+    Some((raw_input.header.hDevice, unsafe { raw_input.data.mouse }))
+}
+
+/// The device info of a raw device, looked up once.
+fn device_meta_of(context: &mut TabletContext, hdevice: HANDLE) -> Option<DeviceMeta> {
+    let key = hdevice as usize;
+    if let Some(meta) = context.device_meta.get(&key) {
+        return Some(meta.clone());
+    }
+    let meta = query_device_meta(hdevice)?;
+    context.device_meta.insert(key, meta.clone());
+    Some(meta)
+}
+
+/// Rebuilds the set of connected tablet vendors.
+///
+/// A tablet in pointer mode reports the pen through a mouse class device
+/// whose path differs from the digitizer path, so the vendor is the only
+/// reliable link between the two.
+fn refresh_tablet_vendors(context: &mut TabletContext) {
+    context.tablet_vendors = context
+        .paths
+        .values()
+        .filter_map(|path| {
+            let (vendor, _) = parse_vid_pid(path);
+            if vendor == 0 {
+                None
+            } else {
+                Some(vendor)
+            }
+        })
+        .collect();
 }
 
 fn raw_hid_packet(buffer: &[usize], bytes_written: usize) -> Option<RawHidPacket<'_>> {
@@ -745,6 +1044,7 @@ fn build_hid_device(hdevice: HANDLE, meta: DeviceMeta) -> Option<HidDevice> {
         pending_sample: None,
         pending_rate_limited: false,
         pen_tip_down: false,
+        pen_samples: 0,
         last_emit: Instant::now() - Duration::from_secs(1),
         max_data_len,
         entries: vec![unsafe { zeroed::<HIDP_DATA>() }; max_data_len],
@@ -1333,6 +1633,7 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     device.last_emit = Instant::now();
     device.last_sample = Some(sample);
     device.pen_tip_down = sample.tip;
+    device.pen_samples += 1;
     crate::diagnostics::PEN_EMITS.fetch_add(1, Ordering::Relaxed);
     crate::diagnostics::IPC_EMITS.fetch_add(1, Ordering::Relaxed);
     let _ = app.emit(
@@ -1384,8 +1685,11 @@ fn flush_pending_pens(context: &mut TabletContext) {
     for device in context.devices.values_mut() {
         flush_pen(device, &context.app);
     }
-    let tip_down = context.devices.values().any(|device| device.pen_tip_down);
-    update_pen_activity(context, tip_down);
+    let native_tip = context.devices.values().any(|device| device.pen_tip_down);
+    // A tablet in pointer mode reports the nib through the mouse, so its
+    // state has to be counted in as well.
+    let pointer_tip = context.pointer_devices.values().any(|device| device.tip_down);
+    update_pen_activity(context, native_tip || pointer_tip);
 }
 
 /// Keeps the rest of the system in sync with what the nib is doing.
@@ -1484,6 +1788,7 @@ mod tests {
             pending_sample: None,
             pending_rate_limited: false,
             pen_tip_down: false,
+            pen_samples: 0,
             last_emit: Instant::now(),
             max_data_len: 0,
             entries: Vec::new(),
