@@ -65,6 +65,7 @@ interface AppSettings {
   fpsCap?: number;
   language?: string;
   pauseHooksWhileDrawing: boolean;
+  diagnosticsEnabled: boolean;
 }
 
 type InputEvent =
@@ -191,6 +192,7 @@ let settings: AppSettings = {
   fpsCap: 0,
   language: 'auto',
   pauseHooksWhileDrawing: false,
+  diagnosticsEnabled: true,
 };
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
@@ -483,6 +485,51 @@ function formatHeaderCatName(cat: CatSkinConfig): string {
       : displayName;
   return `${emoji} KuroCat ${bareName}`;
 }
+
+// --- Diagnostics -------------------------------------------------------
+// The cat has to be diagnosable on machines we cannot see, so the frontend
+// reports how it rendered and how smooth the pen stream was.
+const DIAG_WINDOW_MS = 2000;
+let diagFrameCount = 0;
+let diagLongFrameCount = 0;
+let diagPenEvents = 0;
+let diagMaxPenGapMs = 0;
+let diagLastPenAt = 0;
+
+function noteTabletPenArrival(): void {
+  const now = performance.now();
+  if (diagLastPenAt > 0) {
+    const gap = now - diagLastPenAt;
+    if (gap > diagMaxPenGapMs) diagMaxPenGapMs = gap;
+  }
+  diagLastPenAt = now;
+  diagPenEvents += 1;
+}
+
+function reportDiagnostics(): void {
+  const frames = engine.frameCount - diagFrameCount;
+  const longFrames = engine.longFrameCount - diagLongFrameCount;
+  const maxWorkMs = engine.maxFrameWorkMs;
+  const maxGapMs = engine.maxFrameGapMs;
+  engine.maxFrameWorkMs = 0;
+  engine.maxFrameGapMs = 0;
+  diagFrameCount = engine.frameCount;
+  diagLongFrameCount = engine.longFrameCount;
+  const penEvents = diagPenEvents;
+  const maxPenGapMs = diagMaxPenGapMs;
+  diagPenEvents = 0;
+  diagMaxPenGapMs = 0;
+  void invoke('report_render_stats', {
+    fps: (frames * 1000) / DIAG_WINDOW_MS,
+    longFrames,
+    maxWorkMs,
+    maxGapMs,
+    penEvents,
+    maxPenGapMs,
+  }).catch(() => undefined);
+}
+
+window.setInterval(reportDiagnostics, DIAG_WINDOW_MS);
 
 function renderBreedPills(): void {
   if (!breedPillsEl) return;
@@ -1478,6 +1525,7 @@ async function bootstrap(): Promise<void> {
         engine.onTabletDisconnected();
         break;
       case 'tabletPen':
+        noteTabletPenArrival();
         engine.onTabletPen(
           p.nx,
           p.ny,

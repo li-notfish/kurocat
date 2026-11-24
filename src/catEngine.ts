@@ -314,6 +314,11 @@ const TAIL_PAT_WINDUP_GAP_MS = 260;
 // per keystroke flips the whole tail silhouette, so the blend factor is smoothed instead.
 const TAIL_CROSS_BLEND_RATE = 9;
 
+/** A frame that needs more than this counts as a stutter. */
+const FRAME_WORK_BUDGET_MS = 20;
+/** Gaps larger than this are the idle pause, not a stall. */
+const IDLE_GAP_LIMIT_MS = 1000;
+
 export class KuroCatEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
@@ -337,6 +342,14 @@ export class KuroCatEngine {
   public showKeyBubbles = true;
   public privacyMode = false;
   public onAfterRender: (() => void) | null = null;
+  /** Frames rendered since the app started. */
+  public frameCount = 0;
+  /** Frames that exceeded the frame budget since the last reset. */
+  public longFrameCount = 0;
+  /** Slowest frame since the last reset, in milliseconds. */
+  public maxFrameWorkMs = 0;
+  /** Largest gap between two frames since the last reset, in milliseconds. */
+  public maxFrameGapMs = 0;
   public catBreed: CatBreed = 'black';
   public customSkin: ResolvedSkin | null = null;
   public keyboardLayout: KeyboardLayoutId = '65';
@@ -1932,13 +1945,23 @@ export class KuroCatEngine {
       }
     }
 
-    const dt = Math.min(0.05, Math.max(0.001, (now - this.lastTime) / 1000));
+    const rawInterval = now - this.lastTime;
+    const dt = Math.min(0.05, Math.max(0.001, rawInterval / 1000));
     this.lastTime = now;
     this.lastRenderMs = now;
     this.lastRenderPerfMs = workStart;
     this.update(dt, now);
     this.render();
     this.onAfterRender?.();
+    this.frameCount += 1;
+    const work = performance.now() - workStart;
+    if (work > this.maxFrameWorkMs) this.maxFrameWorkMs = work;
+    if (work > FRAME_WORK_BUDGET_MS) this.longFrameCount += 1;
+    // The renderer stops itself while the cat is idle, so only gaps that
+    // happen while it is awake count as a stall.
+    if (rawInterval < IDLE_GAP_LIMIT_MS && rawInterval > this.maxFrameGapMs) {
+      this.maxFrameGapMs = rawInterval;
+    }
 
     if (this.rafId !== frameId) return;
 

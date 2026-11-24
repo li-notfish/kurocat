@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr;
 use std::slice;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
@@ -183,6 +184,8 @@ struct TabletContext {
     connected: HashSet<String>,
     /// Whether the global hooks are currently paused because the nib is down.
     drawing_pause_active: bool,
+    /// Whether the nib was down during the previous update.
+    pen_tip_down: bool,
 }
 
 unsafe extern "system" fn tablet_wnd_proc(
@@ -243,6 +246,7 @@ fn run(app: AppHandle) {
         paths: HashMap::new(),
         connected: HashSet::new(),
         drawing_pause_active: false,
+        pen_tip_down: false,
     };
     scan_initial_devices(&mut context);
 
@@ -348,6 +352,7 @@ fn handle_device_change(context: &mut TabletContext, event: u32, hdevice: HANDLE
             context.devices.remove(&key);
             let still_present = context.paths.values().any(|known| known == &path);
             if !still_present && context.connected.remove(&path) {
+                crate::diagnostics::event(&format!("tablet_disconnected path={path:?}"));
                 let _ = context
                     .app
                     .emit("kuro-input", InputEvent::TabletDisconnected);
@@ -360,6 +365,14 @@ fn emit_connected(context: &mut TabletContext, meta: &DeviceMeta) {
     if !context.connected.insert(meta.path.clone()) {
         return;
     }
+    crate::diagnostics::event(&format!(
+        "tablet_connected name={:?} usage_page=0x{:04x} usage=0x{:04x} vendor=0x{:04x} path={:?}",
+        meta.name,
+        meta.usage_page,
+        meta.usage,
+        meta.vendor_id,
+        meta.path
+    ));
     let _ = context.app.emit(
         "kuro-input",
         InputEvent::TabletConnected {
@@ -404,6 +417,7 @@ fn handle_raw_input(context: &mut TabletContext, lparam: isize) {
         // reports never need it, and allocating it on every WM_INPUT packet
         // adds avoidable pressure on low-power tablets.
         let mut entries = std::mem::take(&mut device.entries);
+        crate::diagnostics::PEN_REPORTS.fetch_add(packet.report_count as u64, Ordering::Relaxed);
         for index in 0..packet.report_count {
             let start = index * packet.report_size;
             let end = start + packet.report_size;
@@ -868,6 +882,9 @@ fn process_report(
         }
         if let Some(index) = find_report_id(report, WACOM_PEN_REPORT_ID) {
             if let Some(sample) = parse_wacom_pen(device, report, index) {
+                if device.pending_sample.is_some() {
+                    crate::diagnostics::PEN_COALESCED.fetch_add(1, Ordering::Relaxed);
+                }
                 device.pending_sample = Some(sample);
                 return;
             }
@@ -875,6 +892,9 @@ fn process_report(
     }
 
     if let Some(sample) = parse_hid_pen(device, report, entries) {
+        if device.pending_sample.is_some() {
+            crate::diagnostics::PEN_COALESCED.fetch_add(1, Ordering::Relaxed);
+        }
         device.pending_sample = Some(sample);
     }
 }
@@ -1280,6 +1300,7 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     device.last_emit = Instant::now();
     device.last_sample = Some(sample);
     device.pen_tip_down = sample.tip;
+    crate::diagnostics::PEN_EMITS.fetch_add(1, Ordering::Relaxed);
     let _ = app.emit(
         "kuro-input",
         InputEvent::TabletPen {
@@ -1312,6 +1333,15 @@ fn flush_pending_pens(context: &mut TabletContext) {
 /// inside the mouse hook. The global hooks themselves are paused for the
 /// same time so that Photoshop / CSP get the untouched input path.
 fn update_pen_activity(context: &mut TabletContext, tip_down: bool) {
+    if tip_down != context.pen_tip_down {
+        context.pen_tip_down = tip_down;
+        if tip_down {
+            crate::diagnostics::PEN_TIP_DOWN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            crate::diagnostics::PEN_TIP_UP.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::diagnostics::event(&format!("pen_tip={tip_down}"));
+    }
     if tip_down {
         crate::input_hook::suppress_mouse_moves_for(PEN_MOUSE_SUPPRESS_WINDOW);
     }

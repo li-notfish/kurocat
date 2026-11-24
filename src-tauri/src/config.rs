@@ -120,6 +120,10 @@ fn default_pause_hooks_while_drawing() -> bool {
     false
 }
 
+fn default_diagnostics_enabled() -> bool {
+    true
+}
+
 pub fn default_keyboard_layout() -> String {
     if cfg!(feature = "layout-108") {
         "108".to_string()
@@ -251,6 +255,8 @@ pub struct AppSettings {
     pub language: String,
     #[serde(default = "default_pause_hooks_while_drawing")]
     pub pause_hooks_while_drawing: bool,
+    #[serde(default = "default_diagnostics_enabled")]
+    pub diagnostics_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -290,6 +296,7 @@ impl Default for AppSettings {
             fps_cap: default_fps_cap(),
             language: default_language(),
             pause_hooks_while_drawing: default_pause_hooks_while_drawing(),
+            diagnostics_enabled: default_diagnostics_enabled(),
         }
     }
 }

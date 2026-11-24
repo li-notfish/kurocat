@@ -150,6 +150,14 @@ fn build_tray_menu(
         initial.pause_hooks_while_drawing,
         None::<&str>,
     )?;
+    let diagnostics_log = CheckMenuItem::with_id(
+        app,
+        "diagnostics_log",
+        "记录诊断日志（排查输入延迟）",
+        true,
+        initial.diagnostics_enabled,
+        None::<&str>,
+    )?;
     let privacy_guard = CheckMenuItem::with_id(
         app,
         "privacy_guard",
@@ -435,6 +443,7 @@ fn build_tray_menu(
         &[
             &privacy_guard,
             &pause_hooks_while_drawing,
+            &diagnostics_log,
             &key_bubbles,
             &sound_toggle,
             &typing_sound_toggle,
@@ -791,6 +800,15 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     };
                     sync_checkmarks(&updated);
                     let _ = app.emit("kuro-settings", updated);
+                }
+                "diagnostics_log" => {
+                    let mut s = state.settings.lock().unwrap();
+                    s.diagnostics_enabled = !s.diagnostics_enabled;
+                    let enabled = s.diagnostics_enabled;
+                    crate::config::save_settings(&s);
+                    crate::diagnostics::set_enabled(enabled);
+                    let _ = diagnostics_log.set_checked(enabled);
+                    let _ = app.emit("kuro-settings", s.clone());
                 }
                 "privacy_guard" => {
                     let updated = {

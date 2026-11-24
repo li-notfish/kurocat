@@ -2,6 +2,7 @@
 
 mod cats;
 mod config;
+mod diagnostics;
 mod game_detect;
 mod i18n;
 mod input_hook;
@@ -2388,6 +2389,27 @@ fn set_update_banner_open(state: State<'_, AppState>, open: bool) {
 #[tauri::command]
 fn get_app_version() -> String {
     updater::CURRENT_VERSION.to_string()
+}
+
+/// Stores the render health the frontend measured during the last window.
+/// It is the only way to tell a slow cat apart from a slow input pipeline.
+#[tauri::command]
+fn report_render_stats(
+    fps: f64,
+    long_frames: u64,
+    max_work_ms: f64,
+    max_gap_ms: f64,
+    pen_events: u64,
+    max_pen_gap_ms: f64,
+) {
+    diagnostics::set_render_stats(
+        fps,
+        long_frames,
+        max_work_ms,
+        max_gap_ms,
+        pen_events,
+        max_pen_gap_ms,
+    );
 }
 
 #[tauri::command]
@@ -5841,6 +5863,8 @@ pub fn run() {
             peripherals::start_gamepad_listener(handle.clone());
             #[cfg(windows)]
             tablet::start(handle.clone());
+            diagnostics::set_enabled(s.diagnostics_enabled);
+            diagnostics::start();
             start_hit_test_loop(
                 handle.clone(),
                 settings_for_setup,
@@ -5944,6 +5968,7 @@ pub fn run() {
             get_agent_hooks_config,
             get_obs_url,
             get_app_version,
+            report_render_stats,
             update_settings,
             open_context_menu,
             close_context_menu,

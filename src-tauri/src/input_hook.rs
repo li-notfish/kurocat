@@ -140,8 +140,7 @@ thread_local! {
 /// Process-relative millisecond clock. Every thread shares it so a deadline
 /// written on one thread can be compared on another.
 fn now_millis() -> u64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+    crate::diagnostics::now_millis()
 }
 
 pub fn set_password_privacy_active(active: bool) {
@@ -246,6 +245,12 @@ fn sync_hooks_paused() {
     if HOOKS_PAUSED.swap(paused, Ordering::SeqCst) == paused {
         return;
     }
+    crate::diagnostics::HOOK_PAUSE_CHANGES.fetch_add(1, Ordering::Relaxed);
+    crate::diagnostics::event(&format!(
+        "hooks_paused={paused} manual={} drawing_until_ms={}",
+        HOOKS_PAUSED_MANUAL.load(Ordering::Relaxed),
+        HOOKS_PAUSED_DRAWING_UNTIL_MS.load(Ordering::Relaxed)
+    ));
     if paused {
         ALT_HELD.store(false, Ordering::Relaxed);
         #[cfg(windows)]
@@ -512,6 +517,7 @@ pub fn start_global_hooks(app: AppHandle) {
         };
 
         let emit_input = |app: &AppHandle, ev: InputEvent| {
+            crate::diagnostics::IPC_EMITS.fetch_add(1, Ordering::Relaxed);
             crate::obs::broadcast_input(&ev);
             let _ = app.emit("kuro-input", ev);
         };
@@ -646,6 +652,7 @@ pub fn start_global_hooks(app: AppHandle) {
                         if let Some(repeat) = dedup.on_key_down(vk, source, Instant::now()) {
                             if !repeat {
                                 KEY_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                                crate::diagnostics::KEY_EVENTS.fetch_add(1, Ordering::Relaxed);
                             }
                             emit_input(&app, InputEvent::KeyDown { vk, scan, repeat });
                         }
