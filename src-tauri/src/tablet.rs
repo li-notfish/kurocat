@@ -176,6 +176,8 @@ struct HidDevice {
     range: PenRange,
     last_sample: Option<PenSample>,
     pending_sample: Option<PenSample>,
+    /// Whether the pending sample already hit the emit slot limit once.
+    pending_rate_limited: bool,
     /// Whether the nib touched the surface in the last forwarded sample.
     pen_tip_down: bool,
     last_emit: Instant,
@@ -741,6 +743,7 @@ fn build_hid_device(hdevice: HANDLE, meta: DeviceMeta) -> Option<HidDevice> {
         range: PenRange::default(),
         last_sample: None,
         pending_sample: None,
+        pending_rate_limited: false,
         pen_tip_down: false,
         last_emit: Instant::now() - Duration::from_secs(1),
         max_data_len,
@@ -903,6 +906,7 @@ fn process_report(
                     crate::diagnostics::PEN_COALESCED.fetch_add(1, Ordering::Relaxed);
                 }
                 device.pending_sample = Some(sample);
+                device.pending_rate_limited = false;
                 return;
             }
         }
@@ -913,6 +917,7 @@ fn process_report(
             crate::diagnostics::PEN_COALESCED.fetch_add(1, Ordering::Relaxed);
         }
         device.pending_sample = Some(sample);
+        device.pending_rate_limited = false;
     }
 }
 
@@ -1309,16 +1314,18 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
         unchanged && sample.in_range && device.last_emit.elapsed() >= PEN_HEARTBEAT_INTERVAL;
     if unchanged && !heartbeat_due {
         device.pending_sample = None;
+        device.pending_rate_limited = false;
         crate::diagnostics::PEN_UNCHANGED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
     if !sample.in_range && !controls_changed {
         device.pending_sample = None;
+        device.pending_rate_limited = false;
         return;
     }
-    if !controls_changed && device.last_emit.elapsed() < PEN_EMIT_INTERVAL {
-        crate::diagnostics::PEN_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
+    if emit_slot(device, controls_changed, device.last_emit.elapsed()) == EmitSlot::Wait {
+        // The sample stays pending so the newest position is not lost.
         return;
     }
 
@@ -1327,6 +1334,7 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
     device.last_sample = Some(sample);
     device.pen_tip_down = sample.tip;
     crate::diagnostics::PEN_EMITS.fetch_add(1, Ordering::Relaxed);
+    crate::diagnostics::IPC_EMITS.fetch_add(1, Ordering::Relaxed);
     let _ = app.emit(
         "kuro-input",
         InputEvent::TabletPen {
@@ -1340,8 +1348,36 @@ fn flush_pen(device: &mut HidDevice, app: &AppHandle) {
             second_barrel: sample.second_barrel,
             eraser: sample.eraser,
             in_range: sample.in_range,
+            at_ms: crate::diagnostics::epoch_millis(),
         },
     );
+}
+
+/// Whether a pending pen sample may be sent to the frontend now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitSlot {
+    /// The sample goes out now.
+    Ready,
+    /// The sample has to wait for the next frame sized slot.
+    Wait,
+}
+
+/// Decides whether the pending sample may be emitted now.
+///
+/// The emit slot is frame sized, so a sample that arrives too soon waits for
+/// the next slot. A waiting sample is counted only once: every later flush
+/// attempt sees the very same sample, and counting it again made the rate
+/// limiter look like it dropped far more samples than it ever did.
+fn emit_slot(device: &mut HidDevice, controls_changed: bool, elapsed: Duration) -> EmitSlot {
+    if controls_changed || elapsed >= PEN_EMIT_INTERVAL {
+        device.pending_rate_limited = false;
+        return EmitSlot::Ready;
+    }
+    if !device.pending_rate_limited {
+        crate::diagnostics::PEN_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
+        device.pending_rate_limited = true;
+    }
+    EmitSlot::Wait
 }
 
 fn flush_pending_pens(context: &mut TabletContext) {
@@ -1446,6 +1482,7 @@ mod tests {
             range: PenRange::default(),
             last_sample: None,
             pending_sample: None,
+            pending_rate_limited: false,
             pen_tip_down: false,
             last_emit: Instant::now(),
             max_data_len: 0,
@@ -1838,5 +1875,67 @@ mod tests {
     fn raw_hid_packet_rejects_truncated_payload() {
         let (buffer, total) = raw_hid_buffer(16, 1);
         assert!(raw_hid_packet(&buffer, total - 1).is_none());
+    }
+
+    #[test]
+    fn a_waiting_sample_is_only_counted_once_by_the_rate_limiter() {
+        let mut device = fake_device();
+        let before = crate::diagnostics::PEN_RATE_LIMITED.load(Ordering::Relaxed);
+
+        // The same sample is flushed again and again while it waits for the
+        // next slot. It has to be counted a single time.
+        assert_eq!(
+            emit_slot(&mut device, false, Duration::from_millis(1)),
+            EmitSlot::Wait
+        );
+        assert_eq!(
+            emit_slot(&mut device, false, Duration::from_millis(4)),
+            EmitSlot::Wait
+        );
+        assert_eq!(
+            crate::diagnostics::PEN_RATE_LIMITED.load(Ordering::Relaxed) - before,
+            1
+        );
+
+        // The slot frees up and the sample goes out.
+        assert_eq!(
+            emit_slot(&mut device, false, PEN_EMIT_INTERVAL),
+            EmitSlot::Ready
+        );
+        assert_eq!(
+            crate::diagnostics::PEN_RATE_LIMITED.load(Ordering::Relaxed) - before,
+            1
+        );
+    }
+
+    #[test]
+    fn a_new_sample_gets_a_fresh_rate_limit_decision() {
+        let mut device = fake_device();
+        let before = crate::diagnostics::PEN_RATE_LIMITED.load(Ordering::Relaxed);
+
+        assert_eq!(
+            emit_slot(&mut device, false, Duration::from_millis(1)),
+            EmitSlot::Wait
+        );
+        // A newer report replaced the waiting sample, so the fresh sample may
+        // be counted against the rate limiter on its own.
+        device.pending_rate_limited = false;
+        assert_eq!(
+            emit_slot(&mut device, false, Duration::from_millis(2)),
+            EmitSlot::Wait
+        );
+        assert_eq!(
+            crate::diagnostics::PEN_RATE_LIMITED.load(Ordering::Relaxed) - before,
+            2
+        );
+    }
+
+    #[test]
+    fn a_changed_control_ignores_the_emit_slot() {
+        let mut device = fake_device();
+        assert_eq!(
+            emit_slot(&mut device, true, Duration::from_millis(0)),
+            EmitSlot::Ready
+        );
     }
 }

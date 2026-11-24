@@ -2401,6 +2401,7 @@ fn report_render_stats(
     max_gap_ms: f64,
     pen_events: u64,
     max_pen_gap_ms: f64,
+    max_pen_lat_ms: f64,
 ) {
     diagnostics::set_render_stats(
         fps,
@@ -2409,6 +2410,7 @@ fn report_render_stats(
         max_gap_ms,
         pen_events,
         max_pen_gap_ms,
+        max_pen_lat_ms,
     );
 }
 

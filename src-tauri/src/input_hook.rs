@@ -74,6 +74,10 @@ pub enum InputEvent {
         eraser: bool,
         #[serde(rename = "inRange")]
         in_range: bool,
+        /// Wall clock in milliseconds since the epoch, stamped when the
+        /// backend handed the sample to the frontend. The browser compares it
+        /// against `Date.now()` to report the real delivery latency.
+        at_ms: u64,
     },
     TabletKeys {
         buttons: u32,

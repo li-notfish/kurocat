@@ -62,6 +62,9 @@ pub static RENDER_MAX_GAP_MS_MILLI: AtomicU64 = AtomicU64::new(0);
 pub static FRONTEND_PEN_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Largest gap between two pen events the frontend received.
 pub static FRONTEND_PEN_GAP_MAX_MS_MILLI: AtomicU64 = AtomicU64::new(0);
+/// Largest end to end latency of a pen sample, from the moment the backend
+/// sent it to the moment the frontend handled it.
+pub static FRONTEND_PEN_LAT_MAX_MS_MILLI: AtomicU64 = AtomicU64::new(0);
 
 static WRITER: OnceLock<Sender<String>> = OnceLock::new();
 static STARTED: OnceLock<()> = OnceLock::new();
@@ -71,6 +74,22 @@ static STARTED: OnceLock<()> = OnceLock::new();
 pub fn now_millis() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Wall clock in milliseconds since the epoch. The frontend compares this
+/// against `Date.now()`, so a pen sample can carry the moment it was sent
+/// and the browser can report the real delivery latency.
+pub fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies the exact build a log came from. A log from another machine is
+/// useless when it is not known which code produced it.
+pub fn build_id() -> String {
+    format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("KUROCAT_BUILD_ID"))
 }
 
 /// Absolute path of the diagnostics log. `KUROCAT_DIAGNOSTICS_LOG` overrides
@@ -98,8 +117,9 @@ pub fn set_enabled(enabled: bool) {
     }
     if enabled {
         push_line(&format!(
-            "{} | event diagnostics enabled log={}",
+            "{} | event diagnostics enabled build={} log={}",
             timestamp(),
+            build_id(),
             log_path().display()
         ));
     } else {
@@ -113,9 +133,9 @@ pub fn start() {
     STARTED.get_or_init(|| {
         if is_enabled() {
             push_line(&format!(
-                "{} | event session start version={} log={}",
+                "{} | event session start build={} log={}",
                 timestamp(),
-                env!("CARGO_PKG_VERSION"),
+                build_id(),
                 log_path().display()
             ));
         }
@@ -139,6 +159,7 @@ pub fn set_render_stats(
     max_gap_ms: f64,
     pen_events: u64,
     max_pen_gap_ms: f64,
+    max_pen_lat_ms: f64,
 ) {
     RENDER_FPS_MILLI.store(to_milli(fps), Ordering::Relaxed);
     RENDER_LONG_FRAMES.store(long_frames, Ordering::Relaxed);
@@ -146,6 +167,7 @@ pub fn set_render_stats(
     RENDER_MAX_GAP_MS_MILLI.store(to_milli(max_gap_ms), Ordering::Relaxed);
     FRONTEND_PEN_EVENTS.store(pen_events, Ordering::Relaxed);
     FRONTEND_PEN_GAP_MAX_MS_MILLI.store(to_milli(max_pen_gap_ms), Ordering::Relaxed);
+    FRONTEND_PEN_LAT_MAX_MS_MILLI.store(to_milli(max_pen_lat_ms), Ordering::Relaxed);
 }
 
 fn to_milli(value: f64) -> u64 {
@@ -293,8 +315,9 @@ fn summary_line(elapsed_ms: u64, delta: Snapshot) -> String {
     let work = RENDER_MAX_WORK_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     let gap = RENDER_MAX_GAP_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     let pen_gap = FRONTEND_PEN_GAP_MAX_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
+    let pen_lat = FRONTEND_PEN_LAT_MAX_MS_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     format!(
-        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_unch={} pen_rlmt={} pen_tip={}/{} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
+        "{} | summary dt={}ms pen_report={}/s pen_emit={}/s pen_coal={} pen_unch={} pen_rlmt={} pen_tip={}/{} mouse_seen={}/s mouse_fwd={}/s mouse_sup={}/s keys={}/s hook_pause={} ipc={}/s fe_pen={} fe_pen_gap_max={}ms fe_pen_lat_max={}ms fps={} long={} work_max={}ms gap_max={}ms",
         timestamp(),
         elapsed_ms,
         rate(delta.pen_reports),
@@ -312,6 +335,7 @@ fn summary_line(elapsed_ms: u64, delta: Snapshot) -> String {
         rate(delta.ipc_emits),
         FRONTEND_PEN_EVENTS.load(Ordering::Relaxed),
         pen_gap,
+        pen_lat,
         fps,
         RENDER_LONG_FRAMES.load(Ordering::Relaxed),
         work,
@@ -392,6 +416,16 @@ mod tests {
         let line = summary_line(2000, delta);
         assert!(line.contains("pen_report=30/s"), "{line}");
         assert!(line.contains("pen_emit=20/s"), "{line}");
+    }
+
+    #[test]
+    fn build_id_names_the_version_and_the_commit() {
+        let id = build_id();
+        assert!(
+            id.starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))),
+            "unexpected build id: {id}"
+        );
+        assert!(id.len() > env!("CARGO_PKG_VERSION").len() + 1, "{id}");
     }
 
     #[test]

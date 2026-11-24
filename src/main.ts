@@ -94,6 +94,7 @@ type InputEvent =
       secondBarrel: boolean;
       eraser: boolean;
       inRange: boolean;
+      atMs: number;
     }
   | { kind: 'tabletKeys'; buttons: number };
 
@@ -494,19 +495,41 @@ let diagFrameCount = 0;
 let diagLongFrameCount = 0;
 let diagPenEvents = 0;
 let diagMaxPenGapMs = 0;
-let diagLastPenAt = 0;
-let diagPenDown = false;
+let diagMaxPenLatMs = 0;
+let diagLastMoveAt = 0;
+let diagLastPenX = 0;
+let diagLastPenY = 0;
+let diagHasPenPos = false;
+let diagStrokeActive = false;
 
-function noteTabletPenArrival(tip: boolean): void {
+function noteTabletPenArrival(tip: boolean, nx: number, ny: number, atMs: number): void {
   const now = performance.now();
-  // Only a gap inside a stroke says something about the pen stream. The time
-  // between two strokes is the user's own pause and would drown the signal.
-  if (diagPenDown && diagLastPenAt > 0) {
-    const gap = now - diagLastPenAt;
-    if (gap > diagMaxPenGapMs) diagMaxPenGapMs = gap;
+  // A pen that stands still produces no new sample, so the distance between
+  // two arrivals only means something when the nib actually moved. Counting
+  // the pause of a still pen turned the user's own hesitation into a fake
+  // stall, which is why the old number reached 350 ms on a healthy machine.
+  const moved =
+    !diagHasPenPos || Math.hypot(nx - diagLastPenX, ny - diagLastPenY) > 0.0005;
+  if (moved) {
+    if (diagStrokeActive && diagLastMoveAt > 0) {
+      const gap = now - diagLastMoveAt;
+      if (gap > diagMaxPenGapMs) diagMaxPenGapMs = gap;
+    }
+    diagLastMoveAt = now;
+    diagStrokeActive = tip;
+    diagLastPenX = nx;
+    diagLastPenY = ny;
+    diagHasPenPos = true;
+  } else if (!tip) {
+    // The nib left the surface, so the next stroke starts a fresh measurement.
+    diagStrokeActive = false;
+    diagLastMoveAt = 0;
   }
-  diagPenDown = tip;
-  diagLastPenAt = now;
+  // The backend stamps every sample with the wall clock when it sent it, so
+  // this is the real end to end latency of the pen stream and not an
+  // estimate from the frame rate.
+  const latency = Date.now() - atMs;
+  if (latency > diagMaxPenLatMs) diagMaxPenLatMs = latency;
   diagPenEvents += 1;
 }
 
@@ -521,8 +544,10 @@ function reportDiagnostics(): void {
   diagLongFrameCount = engine.longFrameCount;
   const penEvents = diagPenEvents;
   const maxPenGapMs = diagMaxPenGapMs;
+  const maxPenLatMs = diagMaxPenLatMs;
   diagPenEvents = 0;
   diagMaxPenGapMs = 0;
+  diagMaxPenLatMs = 0;
   void invoke('report_render_stats', {
     fps: (frames * 1000) / DIAG_WINDOW_MS,
     longFrames,
@@ -530,6 +555,7 @@ function reportDiagnostics(): void {
     maxGapMs,
     penEvents,
     maxPenGapMs,
+    maxPenLatMs,
   }).catch(() => undefined);
 }
 
@@ -1529,7 +1555,7 @@ async function bootstrap(): Promise<void> {
         engine.onTabletDisconnected();
         break;
       case 'tabletPen':
-        noteTabletPenArrival(p.tip);
+        noteTabletPenArrival(p.tip, p.nx, p.ny, p.atMs);
         engine.onTabletPen(
           p.nx,
           p.ny,
