@@ -529,7 +529,11 @@ function noteTabletPenArrival(tip: boolean, nx: number, ny: number, atMs: number
   // this is the real end to end latency of the pen stream and not an
   // estimate from the frame rate.
   const latency = Date.now() - atMs;
-  if (latency > diagMaxPenLatMs) diagMaxPenLatMs = latency;
+  // A clock step would produce a nonsense value, so only sane latencies
+  // are allowed to become the reported maximum.
+  if (latency > 0 && latency < 10_000 && latency > diagMaxPenLatMs) {
+    diagMaxPenLatMs = latency;
+  }
   diagPenEvents += 1;
 }
 
