@@ -77,6 +77,7 @@ pub enum InputEvent {
         /// Wall clock in milliseconds since the epoch, stamped when the
         /// backend handed the sample to the frontend. The browser compares it
         /// against `Date.now()` to report the real delivery latency.
+        #[serde(rename = "atMs")]
         at_ms: u64,
     },
     TabletKeys {
@@ -3568,5 +3569,28 @@ mod tests {
         );
         // Brand-new fresh install (no settings.json, no marker) -> no stale entries to reset
         assert!(stale_macos_tcc_services_to_reset(Some(fixed_cert), None, false, false, false).is_empty());
+    }
+
+    #[test]
+    fn a_pen_sample_carries_its_send_time_under_the_camel_case_key() {
+        // The frontend reads `atMs`. The enum only renames its variants, so
+        // the field needs its own rename - without it the latency would
+        // always read as zero.
+        let event = InputEvent::TabletPen {
+            nx: 0.5,
+            ny: 0.25,
+            pressure: 0.75,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            tip: true,
+            barrel: false,
+            second_barrel: false,
+            eraser: false,
+            in_range: true,
+            at_ms: 1234,
+        };
+        let json = serde_json::to_string(&event).expect("the event serializes");
+        assert!(json.contains("\"atMs\":1234"), "{json}");
+        assert!(!json.contains("at_ms"), "{json}");
     }
 }
