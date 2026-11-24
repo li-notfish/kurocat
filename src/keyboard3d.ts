@@ -799,6 +799,15 @@ export class KeyboardAndMouse3D {
     this.mouseBodyMat.needsUpdate = true;
   }
 
+  /**
+   * Hides the keyboard and the mouse while a tablet or a gamepad owns the
+   * foreground, so the desk only ever shows the device the cat is using.
+   */
+  public setDeskVisibility(keyboard: boolean, mouse: boolean): void {
+    this.boardGroup.visible = keyboard;
+    this.mouseGroup.visible = keyboard && mouse;
+  }
+
   public rebuildBoard(layoutId: KeyboardLayoutId, orientation: KeyboardOrientation): void {
     // Skip redundant rebuild if nothing changed and meshes already exist
     if (this.sideInstanced && this.layoutId === layoutId && this.orientation === orientation) {

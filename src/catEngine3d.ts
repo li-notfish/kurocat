@@ -26,6 +26,7 @@ import {
   mix,
   smoothstep,
 } from './keyboard3d';
+import { Peripherals3D, type Gamepad3D, type PeripheralMode } from './peripherals3d';
 
 export type CollarColorId = 'none' | 'red' | 'blue' | 'pink' | 'green';
 
@@ -42,6 +43,11 @@ const Z_SCALE = 0.82;
 const BODY_H = 1.98;
 const HEAD_CY = 1.56;
 
+/** The same windows the 2D engine uses for the tablet and gamepad arbitration. */
+const TABLET_ACTIVITY_WINDOW_MS = 1400;
+const TABLET_KEY_SWITCH_GRACE_MS = 220;
+const GAMEPAD_HANDSHAKE_MS = 1400;
+
 interface PawTrack3D {
   side: -1 | 1;
   pos: THREE.Vector3;
@@ -54,7 +60,33 @@ interface PawTrack3D {
   down: boolean;
   lastActive: number;
   tuckWeight: number;
+  /** What the paw is currently reaching for. */
+  reach: 'none' | 'key' | 'mouse' | 'pad' | 'pen';
+  /** World-space target used by the 'pad' and 'pen' reaches. */
+  target: THREE.Vector3;
 }
+
+/** Floating-bubble labels, matching the 2D engine's GAMEPAD_BUTTON_SPECS. */
+const PAD_BUTTON_LABELS: Record<number, string> = {
+  0: 'A',
+  1: 'B',
+  2: 'Y',
+  3: 'X',
+  4: 'LT',
+  5: 'LB',
+  6: 'RT',
+  7: 'RB',
+  8: 'View',
+  9: 'Menu',
+  10: 'Guide',
+  11: 'L3',
+  12: 'R3',
+  13: 'D↑',
+  14: 'D↓',
+  15: 'D←',
+  16: 'D→',
+  17: 'Share',
+};
 
 interface Popup3D {
   keyId: string;
@@ -64,6 +96,7 @@ interface Popup3D {
   t0: number;
   upAt: number | null;
   side: -1 | 1;
+  life?: number;
 }
 
 interface Fx3D {
@@ -798,6 +831,19 @@ export class KuroCatEngine3D {
 
   private readonly angerSprite: THREE.Sprite;
   private readonly popups: Popup3D[] = [];
+  /** Floating bubbles for the peripheral models, kept apart from the key bubbles. */
+  private readonly peripheralPopups: Popup3D[] = [];
+  /** Held state of every gamepad button, so a bubble only pops on a rising edge. */
+  private readonly padHeld: boolean[] = [];
+  /** Held state of the four ExpressKeys. */
+  private readonly tabletKeyHeld: boolean[] = [false, false, false, false];
+  /** Held state of the stylus buttons. */
+  private penTipHeld = false;
+  private penBarrelHeld = false;
+  private penSecondBarrelHeld = false;
+  private penEraserHeld = false;
+  /** Scratch vector for placing peripheral bubbles. */
+  private readonly popupScratch = new THREE.Vector3();
   private readonly fxList: Fx3D[] = [];
   private readonly petMeshes: THREE.Object3D[] = [];
   private readonly raycaster = new THREE.Raycaster();
@@ -891,6 +937,23 @@ export class KuroCatEngine3D {
   private nextBlink = 2.8;
   private nextZ = 0;
   private privacyClose = 0;
+
+  // ---- Peripheral devices (tablet + gamepad) ----
+  private readonly peripherals: Peripherals3D;
+  private deviceMode: PeripheralMode = 'keyboard';
+  private forcedDevice: PeripheralMode | null = null;
+  private tabletHardwareConnected = false;
+  private lastTabletActivityAt = -10000;
+  private lastTabletKeyAt = -10000;
+  private lastNativePenAt = -10000;
+  private lastTabletSignalAt = -10000;
+  private penLastAt = -10000;
+  private padConnected = false;
+  private lastPadConnectedAt = -10000;
+  private lastPadSignalAt = -10000;
+  private pendingTabletKeySwitch: number | null = null;
+  private readonly padScratchA = new THREE.Vector3();
+  private readonly padScratchB = new THREE.Vector3();
 
   private strokes: number[] = [];
   private excite = 0;
@@ -996,6 +1059,7 @@ export class KuroCatEngine3D {
 
     this.camera = new THREE.PerspectiveCamera(22, 1.35, 0.1, 100);
     this.desk = new KeyboardAndMouse3D(this.scene);
+    this.peripherals = new Peripherals3D(this.scene);
     this.pawMat = this.furSystem.createMaterial('PAW');
 
     // 1) Original KuroCat Continuous One-Piece Mochi-Pear Silhouette (exact BODY_SLICES proportions!)
@@ -1376,6 +1440,8 @@ export class KuroCatEngine3D {
         down: false,
         lastActive: -100,
         tuckWeight: 1,
+        reach: 'none',
+        target: new THREE.Vector3(),
       };
     };
     this.paws = { L: mkTrack(-1), R: mkTrack(1) };
@@ -2245,6 +2311,7 @@ export class KuroCatEngine3D {
       this.idleTimer = null;
     }
     this.isIdlePacing = false;
+    this.cancelTabletKeyboardSwitch();
   }
 
   public setGameActive(active: boolean): void {
@@ -2339,6 +2406,7 @@ export class KuroCatEngine3D {
       this.tailRecoil > 0.02 ||
       this.elapsed < this.curiousUntil ||
       this.popups.length > 0 ||
+      this.peripheralPopups.length > 0 ||
       this.fxList.some((fx) => fx.kind !== 'z') ||
       (this.sleepAmt > 0.02 && this.sleepAmt < 0.98) ||
       headsetSettling ||
@@ -2397,6 +2465,7 @@ export class KuroCatEngine3D {
     this.furSystem.applyPalette(p, skin.spots || []);
     this.desk.setAccentColors(p.accent, p.accentRight);
     this.desk.setStyle(this.renderStyle);
+    this.peripherals.setAccentColors(p.accent, p.accentRight);
 
     this.toeMat.color.set(p.toe);
     this.whiskerMat.color.set(p.whisker);
@@ -2922,6 +2991,41 @@ export class KuroCatEngine3D {
       }
       return;
     }
+    const now = performance.now();
+    // A controller that is still shaking hands, or a tablet that owns the
+    // keyboard right now, keeps the foreground. The 2D engine follows the same
+    // rules, so both renderers always agree on what is in front of the cat.
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+    if (this.shouldTreatKeyboardAsTabletExpressKey(now)) {
+      this.wake();
+      if (!repeat) {
+        const spec = this.desk.resolveKey(vk);
+        if (spec) {
+          this.spawnKeyPopup(
+            spec.spec.id,
+            spec.spec.bubble || spec.spec.label || spec.spec.id,
+            this.paws.L.side,
+          );
+        }
+      }
+      return;
+    }
+    if (this.shouldDeferKeyboardSwitchForTablet()) {
+      this.wake();
+      this.scheduleTabletKeyboardSwitch();
+      if (!repeat) {
+        const spec = this.desk.resolveKey(vk);
+        if (spec) {
+          this.spawnKeyPopup(
+            spec.spec.id,
+            spec.spec.bubble || spec.spec.label || spec.spec.id,
+            this.paws.L.side,
+          );
+        }
+      }
+      return;
+    }
+    this.setDeviceFromInput('keyboard');
     const k = this.desk.resolveKey(vk);
     if (!k) return;
     this.wake(repeat ? 'gentle' : 'abrupt');
@@ -2952,6 +3056,7 @@ export class KuroCatEngine3D {
     const paw = this.paws[pawKey];
     paw.from.copy(paw.pos);
     paw.keyId = k.spec.id;
+    paw.reach = 'key';
     paw.t0 = this.elapsed;
     paw.lastActive = this.elapsed;
     const keyWorld = this.desk.keyTopWorld(k.spec.id, this.tmpV1);
@@ -3047,6 +3152,16 @@ export class KuroCatEngine3D {
   }
 
   public onMouseDown(btn: string): void {
+    const now = performance.now();
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+    if (this.deviceMode === 'tablet') {
+      // The tablet owns the foreground. Windows Ink mirrors the pen as a
+      // synthetic mouse button, so a click while the raw HID pen is alive
+      // belongs to the tablet, not the mouse.
+      if (this.forcedDevice === 'tablet') return;
+      if (this.tabletHardwareConnected && this.tabletPenOwnsInput(now)) return;
+    }
+    this.setDeviceFromInput('keyboard');
     this.wake('abrupt');
     this.lastMouse = this.elapsed;
     this.paws.L.lastActive = this.elapsed;
@@ -3062,10 +3177,328 @@ export class KuroCatEngine3D {
   }
 
   public onMouseWheel(): void {
+    const now = performance.now();
+    if (this.shouldHoldGamepadThroughHandshake(now)) return;
+    if (this.deviceMode === 'tablet') {
+      if (this.forcedDevice === 'tablet') return;
+      if (this.tabletHardwareConnected && this.tabletPenOwnsInput(now)) return;
+    }
+    this.setDeviceFromInput('keyboard');
     this.wake('abrupt');
     this.lastMouse = this.elapsed;
     this.paws.L.lastActive = this.elapsed;
     this.desk.pulseScrollWheel();
+  }
+
+  // ---- Peripheral arbitration (mirrors the rules of the 2D engine) ----
+
+  private setDeviceFromInput(device: PeripheralMode): void {
+    if (this.forcedDevice || this.deviceMode === device) return;
+    this.deviceMode = device;
+    if (device === 'keyboard') {
+      this.cancelTabletKeyboardSwitch();
+      this.desk.releaseAllKeys();
+      for (const paw of [this.paws.L, this.paws.R]) {
+        if (paw.reach === 'pad' || paw.reach === 'pen') {
+          paw.reach = 'none';
+          paw.down = false;
+        }
+      }
+    }
+  }
+
+  private shouldTreatKeyboardAsTabletExpressKey(now: number): boolean {
+    if (this.deviceMode !== 'tablet') return false;
+    if (this.forcedDevice === 'tablet') return false;
+    if (!this.tabletHardwareConnected) return false;
+    return (
+      now - this.lastTabletActivityAt < TABLET_ACTIVITY_WINDOW_MS ||
+      now - this.lastTabletKeyAt < TABLET_ACTIVITY_WINDOW_MS
+    );
+  }
+
+  private shouldDeferKeyboardSwitchForTablet(): boolean {
+    if (this.forcedDevice) return false;
+    if (!this.tabletHardwareConnected) return false;
+    return this.deviceMode === 'tablet';
+  }
+
+  private scheduleTabletKeyboardSwitch(): void {
+    if (this.pendingTabletKeySwitch !== null) return;
+    this.pendingTabletKeySwitch = window.setTimeout(() => {
+      this.pendingTabletKeySwitch = null;
+      if (this.forcedDevice) return;
+      if (this.deviceMode !== 'tablet') return;
+      this.setDeviceFromInput('keyboard');
+    }, TABLET_KEY_SWITCH_GRACE_MS);
+  }
+
+  private cancelTabletKeyboardSwitch(): void {
+    if (this.pendingTabletKeySwitch === null) return;
+    window.clearTimeout(this.pendingTabletKeySwitch);
+    this.pendingTabletKeySwitch = null;
+  }
+
+  private tabletPenOwnsInput(now: number): boolean {
+    if (!this.tabletHardwareConnected) return false;
+    return now - this.lastTabletSignalAt < 1500 || now - this.lastNativePenAt < 1500;
+  }
+
+  private shouldHoldGamepadThroughHandshake(now: number): boolean {
+    return (
+      !this.forcedDevice &&
+      this.deviceMode === 'gamepad' &&
+      this.padConnected &&
+      now - this.lastPadConnectedAt < GAMEPAD_HANDSHAKE_MS
+    );
+  }
+
+  /** Mirrors the tray's "device demo" entry. */
+  public setDevicePreview(mode: 'auto' | 'keyboard' | 'tablet' | 'gamepad'): void {
+    if (mode === 'auto') {
+      this.forcedDevice = null;
+      this.deviceMode = this.padConnected ? 'gamepad' : 'keyboard';
+      this.peripherals.gamepad.releaseAll();
+      this.peripherals.tablet.setPen({ inRange: false, tip: false, pressure: 0 });
+      this.peripherals.tablet.setKeys(0);
+      return;
+    }
+    this.deviceMode = mode;
+    this.forcedDevice = mode;
+    if (mode !== 'gamepad') this.peripherals.gamepad.releaseAll();
+    if (mode !== 'tablet') {
+      this.peripherals.tablet.setPen({ inRange: false, tip: false, pressure: 0 });
+      this.peripherals.tablet.setKeys(0);
+    }
+    this.wake();
+  }
+
+  // ---- Tablet (Windows Raw Input HID) ----
+
+  public onTabletConnected(_name: string): void {
+    this.tabletHardwareConnected = true;
+    this.lastTabletActivityAt = -10000;
+    this.lastTabletKeyAt = -10000;
+    this.lastNativePenAt = -10000;
+    this.lastTabletSignalAt = -10000;
+    this.wake();
+  }
+
+  public onTabletDisconnected(): void {
+    this.tabletHardwareConnected = false;
+    this.peripherals.tablet.setPen({ inRange: false, tip: false, pressure: 0 });
+    this.peripherals.tablet.setKeys(0);
+  }
+
+  public onTabletPen(
+    nx: number,
+    ny: number,
+    pressure: number,
+    tiltX: number,
+    tiltY: number,
+    tip: boolean,
+    barrel: boolean,
+    secondBarrel: boolean,
+    eraser: boolean,
+    inRange: boolean,
+  ): void {
+    const now = performance.now();
+    this.lastTabletSignalAt = now;
+    this.lastTabletActivityAt = now;
+    this.cancelTabletKeyboardSwitch();
+    this.peripherals.tablet.setPen({
+      nx,
+      ny,
+      pressure: Math.max(0, Math.min(1, pressure)),
+      tiltX: Math.max(-1, Math.min(1, tiltX)),
+      tiltY: Math.max(-1, Math.min(1, tiltY)),
+      tip,
+      barrel,
+      secondBarrel,
+      eraser,
+      inRange,
+    });
+    // Floating badges for the stylus buttons, on the rising edge of each.
+    const penEdges: Array<[boolean, boolean, string]> = [
+      [tip, this.penTipHeld, 'PEN'],
+      [barrel, this.penBarrelHeld, 'B1'],
+      [secondBarrel, this.penSecondBarrelHeld, 'B2'],
+      [eraser, this.penEraserHeld, 'ER'],
+    ];
+    for (const [on, wasHeld, label] of penEdges) {
+      if (on && !wasHeld) {
+        this.peripherals.tablet.penTipWorld(this.popupScratch);
+        this.spawnPeripheralPopup(label, this.popupScratch, -1);
+      }
+    }
+    this.penTipHeld = tip;
+    this.penBarrelHeld = barrel;
+    this.penSecondBarrelHeld = secondBarrel;
+    this.penEraserHeld = eraser;
+    if (inRange) {
+      this.lastNativePenAt = now;
+      this.penLastAt = now;
+      this.setDeviceFromInput('tablet');
+    }
+    this.wake();
+  }
+
+  public onTabletKeys(buttons: number): void {
+    const now = performance.now();
+    this.lastTabletSignalAt = now;
+    this.lastTabletActivityAt = now;
+    this.lastTabletKeyAt = now;
+    this.cancelTabletKeyboardSwitch();
+    const mask = buttons & 0x0f;
+    this.peripherals.tablet.setKeys(mask);
+    this.setDeviceFromInput('tablet');
+    this.wake();
+
+    // One floating badge per ExpressKey, on the rising edge.
+    for (let index = 0; index < 4; index++) {
+      const on = (mask & (1 << index)) !== 0;
+      if (on && !this.tabletKeyHeld[index]) {
+        this.peripherals.tablet.keyWorld(index, this.popupScratch);
+        this.spawnPeripheralPopup(`K${index + 1}`, this.popupScratch, -1);
+      }
+      this.tabletKeyHeld[index] = on;
+    }
+  }
+
+  // ---- Gamepad (gilrs / XInput) ----
+
+  public onGamepadConnected(_id: number, _name: string): void {
+    this.padConnected = true;
+    this.lastPadConnectedAt = performance.now();
+    this.setDeviceFromInput('gamepad');
+    this.wake();
+  }
+
+  public onGamepadDisconnected(_id: number): void {
+    this.padConnected = false;
+    this.peripherals.gamepad.releaseAll();
+  }
+
+  public onGamepadButton(_id: number, button: number, pressed: boolean, value: number): void {
+    const level = Math.max(0, Math.min(1, value));
+    this.lastPadSignalAt = performance.now();
+    this.peripherals.gamepad.setButton(button, level);
+    this.setDeviceFromInput('gamepad');
+    this.wake();
+
+    // The button path and the axis path share `padHeld`, so a trigger that a
+    // pad reports twice only pops one bubble.
+    const down = pressed || level > 0.06;
+    const wasHeld = this.padHeld[button] ?? false;
+    this.padHeld[button] = down;
+    if (down && !wasHeld) this.popPadBubble(button);
+  }
+
+  public onGamepadAxis(_id: number, axis: number, value: number): void {
+    this.lastPadSignalAt = performance.now();
+    this.peripherals.gamepad.setAxis(axis, value);
+    this.setDeviceFromInput('gamepad');
+    this.wake();
+
+    // gilrs reports the analog triggers as axes on some backends, so the
+    // bubble has to come from the same held state the button path uses.
+    const triggerButton = axis === 4 ? 4 : axis === 5 ? 6 : null;
+    if (triggerButton !== null) {
+      const down = Math.abs(value) > 0.06;
+      const wasHeld = this.padHeld[triggerButton] ?? false;
+      this.padHeld[triggerButton] = down;
+      if (down && !wasHeld) this.popPadBubble(triggerButton);
+    }
+  }
+
+  /** Floating bubble above a gamepad button. */
+  private popPadBubble(button: number): void {
+    const label = PAD_BUTTON_LABELS[button];
+    if (!label) return;
+    this.peripherals.gamepad.buttonWorld(button, this.popupScratch);
+    // The face cluster sits on the left of the pad, the D-pad on the right.
+    const side: -1 | 1 = button <= 12 ? -1 : 1;
+    this.spawnPeripheralPopup(label, this.popupScratch, side);
+  }
+
+  /**
+   * Drives the 3D tablet and gamepad models. The 3D engine runs its own
+   * arbitration instead of reading the 2D engine's device mode, because the
+   * desktop routes keyboard and mouse events to whichever renderer is live.
+   */
+  private updatePeripherals(dt: number): void {
+    const gamepad = this.peripherals.gamepad;
+    const tablet = this.peripherals.tablet;
+
+    // The tray's "device demo" has to look alive even without real hardware.
+    if (this.forcedDevice === 'tablet' && performance.now() - this.penLastAt > 2500) {
+      const t = this.elapsed;
+      tablet.setPen({
+        nx: 0.5 + 0.32 * Math.sin(t * 0.95 + 0.4),
+        ny: 0.5 + 0.26 * Math.sin(t * 1.37 + 1.15),
+        pressure: 0.38 + 0.4 * (0.5 + 0.5 * Math.sin(t * 2.2)),
+        inRange: true,
+        tip: true,
+      });
+    }
+    if (this.forcedDevice === 'gamepad' && !this.padConnected) {
+      this.driveGamepadDemo(gamepad);
+    }
+
+    this.peripherals.setMode(this.deviceMode);
+    this.peripherals.update(dt, this.elapsed);
+
+    if (this.deviceMode === 'gamepad') {
+      const face = gamepad.firstPressed([0, 1, 2, 3]);
+      const dpad = gamepad.firstPressed([13, 14, 15, 16]);
+      const leftTarget =
+        face >= 0
+          ? gamepad.buttonWorld(face, this.padScratchA)
+          : gamepad.stickWorld(0, this.padScratchA);
+      const rightTarget =
+        dpad >= 0
+          ? gamepad.buttonWorld(dpad, this.padScratchB)
+          : gamepad.stickWorld(1, this.padScratchB);
+      this.reachWithPaw(this.paws.L, leftTarget, face >= 0);
+      this.reachWithPaw(this.paws.R, rightTarget, dpad >= 0);
+    } else if (this.deviceMode === 'tablet') {
+      // The paw only grabs the stylus while the pen is actually on the tablet,
+      // exactly like the 2D engine does.
+      const penLive =
+        this.forcedDevice === 'tablet' ||
+        tablet.isPenActive() ||
+        performance.now() - this.penLastAt < 1600;
+      this.paws.L.reach = penLive ? 'pen' : 'none';
+      this.paws.L.down = false;
+      this.paws.R.reach = 'none';
+      this.paws.R.down = false;
+    }
+  }
+
+  /** A lazy controller demo so the tray's device preview has something to show. */
+  private driveGamepadDemo(gamepad: Gamepad3D): void {
+    const t = this.elapsed;
+    for (const id of [0, 1, 2, 3, 13, 14, 15, 16]) gamepad.setButton(id, 0);
+    gamepad.setButton([0, 1, 2, 3][Math.floor(t / 0.9) % 4], 1);
+    gamepad.setAxis(0, Math.sin(t * 1.6) * 0.72);
+    gamepad.setAxis(1, Math.cos(t * 1.15) * 0.55);
+    gamepad.setAxis(2, Math.cos(t * 0.95) * 0.62);
+    gamepad.setAxis(3, Math.sin(t * 1.35) * 0.48);
+  }
+
+  /** Points a paw at a controller control and presses it while it is held. */
+  private reachWithPaw(paw: PawTrack3D, target: THREE.Vector3, pressing: boolean): void {
+    paw.target.copy(target);
+    paw.reach = 'pad';
+    paw.lastActive = this.elapsed;
+    if (pressing && !paw.down) {
+      paw.from.copy(paw.pos);
+      paw.t0 = this.elapsed;
+      paw.dur = clamp(paw.pos.distanceTo(target) * 0.085, 0.048, 0.095);
+      paw.down = true;
+    } else if (!pressing) {
+      paw.down = false;
+    }
   }
 
   public onPointerMove(
@@ -3295,6 +3728,63 @@ export class KuroCatEngine3D {
       const old = this.popups.shift()!;
       this.scene.remove(old.sprite);
       old.sprite.material.dispose();
+    }
+  }
+
+  /**
+   * Floating bubble above a peripheral control. The 3D gamepad and tablet
+   * have their own buttons and ExpressKeys, so they need their own bubbles
+   * instead of the keyboard's key bubbles.
+   */
+  private spawnPeripheralPopup(label: string, world: THREE.Vector3, side: -1 | 1): void {
+    if (!this.showKeyBubbles || this.privacyMode) return;
+    const clean = label.length > 6 ? label.slice(0, 6) : label;
+    const { tex, aspect } = getPopupTexture(clean);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(mat);
+    const baseH = 0.18;
+    const baseW = baseH * aspect;
+    sprite.scale.set(baseW, baseH, 1);
+    sprite.renderOrder = 40;
+    const jitterX = (Math.random() - 0.5) * 0.06;
+    const jitterY = Math.random() * 0.05;
+    sprite.position.set(world.x + jitterX, world.y + 0.16 + jitterY, world.z);
+    this.scene.add(sprite);
+    this.peripheralPopups.push({
+      keyId: `peripheral:${label}`,
+      sprite,
+      baseW,
+      baseH,
+      t0: this.elapsed,
+      upAt: null,
+      side,
+      life: 0.95,
+    });
+    if (this.peripheralPopups.length > 8) {
+      const old = this.peripheralPopups.shift()!;
+      this.scene.remove(old.sprite);
+      old.sprite.material.dispose();
+    }
+  }
+
+  /** Shared float-and-fade animation for both bubble lists. */
+  private animatePopups(list: Popup3D[], dt: number, t: number): void {
+    for (let i = list.length - 1; i >= 0; i--) {
+      const p = list[i];
+      const age = t - p.t0;
+      const tailAge = p.upAt !== null ? t - p.upAt : 0;
+      if (age > (p.life ?? 1.2) || tailAge > 0.55) {
+        this.scene.remove(p.sprite);
+        p.sprite.material.dispose();
+        list.splice(i, 1);
+        continue;
+      }
+      const pop = smoothstep(0, 0.12, age);
+      const fade = p.upAt !== null ? 1 - smoothstep(0.18, 0.55, tailAge) : 1;
+      p.sprite.position.y += dt * 0.20;
+      const s = 0.72 + 0.28 * pop;
+      p.sprite.scale.set(p.baseW * s, p.baseH * s, 1);
+      p.sprite.material.opacity = fade;
     }
   }
 
@@ -3675,7 +4165,12 @@ export class KuroCatEngine3D {
     this.desk.deskGroup.visible = peek < 0.85;
     this.catShadow.visible = this.chromaKeyBg === null && peek < 0.35;
 
-    // 4) Spine lean, hunch, squash & breathing on continuous one-piece body (+ scruff lift & pendulum!)
+    // 3b) Tablet & gamepad take the desk over while one of them owns the
+    // foreground. The keyboard and the mouse step aside for them.
+    this.updatePeripherals(dt);
+    this.desk.setDeskVisibility(this.deviceMode === 'keyboard', this.deviceMode === 'keyboard');
+
+    // 4) Spine lean, hunch, squash & breathing on continuous one-piece body
     const mousing = this.isMousing();
     const typingActive = t - this.lastKey < 0.65 || this.paws.L.down || this.paws.R.down;
     const striking =
@@ -4153,13 +4648,16 @@ export class KuroCatEngine3D {
     // 9) Sleek Unified KuroCat Arms + Cozy Tucked Idle Belly Paws + Scruff / Edge-Peek Grip / Groom / Stretch / Knead!
     this.headMount.updateMatrixWorld(false);
     const updatePaw = (paw: PawTrack3D, isLeft: boolean) => {
-      const activeForMouse = isLeft && mousing && scruff < 0.12 && peek < 0.25;
+      const activeForMouse =
+        isLeft && mousing && this.deviceMode === 'keyboard' && scruff < 0.12 && peek < 0.25;
       const activeForKey =
-        Boolean(paw.keyId && (paw.down || t - paw.t0 < 0.52)) &&
+        Boolean(paw.keyId && paw.reach === 'key' && (paw.down || t - paw.t0 < 0.52)) &&
         !this.asleep &&
         !this.privacyMode &&
         scruff < 0.12 &&
         peek < 0.25;
+      const activeForPad = paw.reach === 'pad' && !this.asleep && !this.privacyMode;
+      const activeForPen = paw.reach === 'pen' && !this.asleep && !this.privacyMode;
       const activeForScruff = scruff > 0.14 && !this.privacyMode;
       const activeForPeek = !activeForScruff && peek > 0.22;
       const activeForGroom =
@@ -4180,7 +4678,9 @@ export class KuroCatEngine3D {
         !activeForPeek &&
         !activeForGroom &&
         !activeForStretch &&
-        !activeForKnead
+        !activeForKnead &&
+        !activeForPad &&
+        !activeForPen
           ? 1
           : 0;
       paw.tuckWeight += (wantTuck - paw.tuckWeight) * approach(wantTuck ? 6.5 : 20, dt);
@@ -4268,6 +4768,27 @@ export class KuroCatEngine3D {
       if (activeForMouse) {
         const mt = this.desk.mouseTopWorld(this.tmpV1);
         paw.pos.copy(paw.spring.step(mt, dt));
+        paw.last.copy(paw.pos);
+        return;
+      }
+      if (activeForPen) {
+        const grip = this.peripherals.tablet.penGripWorld(this.tmpV1);
+        paw.pos.copy(paw.spring.step(grip, dt));
+        paw.last.copy(paw.pos);
+        return;
+      }
+      if (activeForPad) {
+        const kt = paw.target;
+        if (paw.down) {
+          const u = clamp((t - paw.t0) / paw.dur, 0, 1);
+          paw.pos.lerpVectors(paw.from, kt, smoothstep(0, 1, u));
+          paw.pos.y += Math.sin(u * Math.PI) * 0.22;
+          paw.spring.x.copy(paw.pos);
+          paw.spring.v.set(0, 0, 0);
+        } else {
+          const hover = this.tmpV2.set(kt.x, kt.y + 0.14, kt.z - 0.05);
+          paw.pos.copy(paw.spring.step(hover, dt));
+        }
         paw.last.copy(paw.pos);
         return;
       }
@@ -4373,23 +4894,8 @@ export class KuroCatEngine3D {
     }
 
     // 10) Floating Key Bubbles, Anger Mark 💢 & Sleep Zzz FX
-    for (let i = this.popups.length - 1; i >= 0; i--) {
-      const p = this.popups[i];
-      const age = t - p.t0;
-      const tailAge = p.upAt !== null ? t - p.upAt : 0;
-      if (age > 1.2 || tailAge > 0.55) {
-        this.scene.remove(p.sprite);
-        p.sprite.material.dispose();
-        this.popups.splice(i, 1);
-        continue;
-      }
-      const pop = smoothstep(0, 0.12, age);
-      const fade = p.upAt !== null ? 1 - smoothstep(0.18, 0.55, tailAge) : 1;
-      p.sprite.position.y += dt * 0.20;
-      const s = 0.72 + 0.28 * pop;
-      p.sprite.scale.set(p.baseW * s, p.baseH * s, 1);
-      p.sprite.material.opacity = fade;
-    }
+    this.animatePopups(this.popups, dt, t);
+    this.animatePopups(this.peripheralPopups, dt, t);
 
     if (cross > 0.25) {
       this.angerSprite.visible = true;

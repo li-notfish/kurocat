@@ -357,8 +357,7 @@ function wants3DNow(): boolean {
     settings.catBreed !== 'dafeiyu' &&
     !tailPickerOpen &&
     !isWin7Ulw &&
-    !webgl3dUnavailable &&
-    !engine.hasPeripheralForeground()
+    !webgl3dUnavailable
   );
 }
 
@@ -486,17 +485,6 @@ function formatHeaderCatName(cat: CatSkinConfig): string {
       ? displayName.slice(cat.emoji.length).trimStart()
       : displayName;
   return `${emoji} KuroCat ${bareName}`;
-}
-
-
-// The 3D engine ships no tablet / gamepad models, so the desktop falls back to
-// the 2D engine while a peripheral drives the foreground.
-let peripheralEngineActive = false;
-function syncPeripheralEngine(): void {
-  const active = engine.hasPeripheralForeground();
-  if (active === peripheralEngineActive) return;
-  peripheralEngineActive = active;
-  activateRenderEngine();
 }
 
 // --- Diagnostics -------------------------------------------------------
@@ -1480,6 +1468,7 @@ async function bootstrap(): Promise<void> {
     const mode = ev.payload;
     if (mode === 'auto' || mode === 'keyboard' || mode === 'tablet' || mode === 'gamepad') {
       engine.setDevicePreview(mode);
+      engine3d?.setDevicePreview(mode);
     }
   });
   await listen<InputEvent>('kuro-input', (ev) => {
@@ -1554,26 +1543,27 @@ async function bootstrap(): Promise<void> {
         break;
       case 'gamepadConnected':
         engine.onGamepadConnected(p.id, p.name);
-        syncPeripheralEngine();
+        engine3d?.onGamepadConnected(p.id, p.name);
         break;
       case 'gamepadDisconnected':
         engine.onGamepadDisconnected(p.id);
-        syncPeripheralEngine();
+        engine3d?.onGamepadDisconnected(p.id);
         break;
       case 'gamepadButton':
         engine.onGamepadButton(p.id, p.button, p.pressed, p.value);
-        syncPeripheralEngine();
+        engine3d?.onGamepadButton(p.id, p.button, p.pressed, p.value);
         break;
       case 'gamepadAxis':
         engine.onGamepadAxis(p.id, p.axis, p.value);
-        syncPeripheralEngine();
+        engine3d?.onGamepadAxis(p.id, p.axis, p.value);
         break;
       case 'tabletConnected':
         engine.onTabletConnected(p.name);
+        engine3d?.onTabletConnected(p.name);
         break;
       case 'tabletDisconnected':
         engine.onTabletDisconnected();
-        syncPeripheralEngine();
+        engine3d?.onTabletDisconnected();
         break;
       case 'tabletPen':
         noteTabletPenArrival(p.tip, p.nx, p.ny, p.atMs);
@@ -1589,11 +1579,22 @@ async function bootstrap(): Promise<void> {
           p.eraser,
           p.inRange,
         );
-        syncPeripheralEngine();
+        engine3d?.onTabletPen(
+          p.nx,
+          p.ny,
+          p.pressure,
+          p.tiltX,
+          p.tiltY,
+          p.tip,
+          p.barrel,
+          p.secondBarrel,
+          p.eraser,
+          p.inRange,
+        );
         break;
       case 'tabletKeys':
         engine.onTabletKeys(p.buttons);
-        syncPeripheralEngine();
+        engine3d?.onTabletKeys(p.buttons);
         break;
     }
   });
