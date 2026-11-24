@@ -2950,6 +2950,17 @@ export class KuroCatEngine {
     this.rightPaw.mode = 'idle';
   }
 
+  /**
+   * True while a tablet or a gamepad owns the foreground. The 3D engine has
+   * no peripheral models, so the desktop has to fall back to the 2D engine
+   * while one of them is in use.
+   */
+  public hasPeripheralForeground(): boolean {
+    if (this.forcedDevice === 'tablet' || this.forcedDevice === 'gamepad') return true;
+    if (this.deviceMode !== 'keyboard') return true;
+    return this.gamepads.size > 0;
+  }
+
   private setDeviceFromInput(device: ForegroundDevice): void {
     if (this.forcedDevice || this.deviceMode === device) return;
     this.deviceMode = device;

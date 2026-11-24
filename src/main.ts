@@ -357,7 +357,8 @@ function wants3DNow(): boolean {
     settings.catBreed !== 'dafeiyu' &&
     !tailPickerOpen &&
     !isWin7Ulw &&
-    !webgl3dUnavailable
+    !webgl3dUnavailable &&
+    !engine.hasPeripheralForeground()
   );
 }
 
@@ -485,6 +486,17 @@ function formatHeaderCatName(cat: CatSkinConfig): string {
       ? displayName.slice(cat.emoji.length).trimStart()
       : displayName;
   return `${emoji} KuroCat ${bareName}`;
+}
+
+
+// The 3D engine ships no tablet / gamepad models, so the desktop falls back to
+// the 2D engine while a peripheral drives the foreground.
+let peripheralEngineActive = false;
+function syncPeripheralEngine(): void {
+  const active = engine.hasPeripheralForeground();
+  if (active === peripheralEngineActive) return;
+  peripheralEngineActive = active;
+  activateRenderEngine();
 }
 
 // --- Diagnostics -------------------------------------------------------
@@ -1542,21 +1554,26 @@ async function bootstrap(): Promise<void> {
         break;
       case 'gamepadConnected':
         engine.onGamepadConnected(p.id, p.name);
+        syncPeripheralEngine();
         break;
       case 'gamepadDisconnected':
         engine.onGamepadDisconnected(p.id);
+        syncPeripheralEngine();
         break;
       case 'gamepadButton':
         engine.onGamepadButton(p.id, p.button, p.pressed, p.value);
+        syncPeripheralEngine();
         break;
       case 'gamepadAxis':
         engine.onGamepadAxis(p.id, p.axis, p.value);
+        syncPeripheralEngine();
         break;
       case 'tabletConnected':
         engine.onTabletConnected(p.name);
         break;
       case 'tabletDisconnected':
         engine.onTabletDisconnected();
+        syncPeripheralEngine();
         break;
       case 'tabletPen':
         noteTabletPenArrival(p.tip, p.nx, p.ny, p.atMs);
@@ -1572,9 +1589,11 @@ async function bootstrap(): Promise<void> {
           p.eraser,
           p.inRange,
         );
+        syncPeripheralEngine();
         break;
       case 'tabletKeys':
         engine.onTabletKeys(p.buttons);
+        syncPeripheralEngine();
         break;
     }
   });
